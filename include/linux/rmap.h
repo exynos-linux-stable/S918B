@@ -11,6 +11,10 @@
 #include <linux/rwsem.h>
 #include <linux/memcontrol.h>
 #include <linux/highmem.h>
+#ifndef __GENKSYMS__
+#define PROTECT_TRACE_INCLUDE_PATH
+#include <trace/hooks/mm.h>
+#endif
 
 /*
  * The anon_vma heads a list of private "related" vmas, to scan if
@@ -95,6 +99,7 @@ enum ttu_flags {
 					 * do a final flush if necessary */
 	TTU_RMAP_LOCKED		= 0x80,	/* do not grab rmap lock:
 					 * caller holds it */
+	TTU_RMAP_TRY_LOCK	= 0x100,	/* try to grab rmap lock */
 };
 
 #ifdef CONFIG_MMU
@@ -182,7 +187,12 @@ void hugepage_add_new_anon_rmap(struct page *, struct vm_area_struct *,
 
 static inline void page_dup_rmap(struct page *page, bool compound)
 {
-	atomic_inc(compound ? compound_mapcount_ptr(page) : &page->_mapcount);
+	bool success = false;
+
+	if (!compound)
+		trace_android_vh_update_page_mapcount(page, true, compound, NULL, &success);
+	if (!success)
+		atomic_inc(compound ? compound_mapcount_ptr(page) : &page->_mapcount);
 }
 
 /*
@@ -267,6 +277,9 @@ struct rmap_walk_control {
 	 * Return false if page table scanning in rmap_walk should be stopped.
 	 * Otherwise, return true.
 	 */
+#ifdef CONFIG_PAGE_BOOST
+	int ret;
+#endif
 	bool (*rmap_one)(struct page *page, struct vm_area_struct *vma,
 					unsigned long addr, void *arg);
 	int (*done)(struct page *page);
@@ -275,6 +288,7 @@ struct rmap_walk_control {
 };
 
 void rmap_walk(struct page *page, struct rmap_walk_control *rwc);
+void rmap_walk_trylock(struct page *page, struct rmap_walk_control *rwc);
 void rmap_walk_locked(struct page *page, struct rmap_walk_control *rwc);
 
 #else	/* !CONFIG_MMU */

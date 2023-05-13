@@ -901,7 +901,21 @@ int page_referenced(struct page *page,
 		rwc.invalid_vma = invalid_page_referenced_vma;
 	}
 
-	rmap_walk(page, &rwc);
+	if (need_memory_boosting() && !PageAnon(page)) {
+		struct address_space *mapping = page_mapping(page);
+
+		if (mapping != NULL) {
+			if (i_mmap_trylock_read(mapping)) {
+				rmap_walk_locked(page, &rwc);
+				i_mmap_unlock_read(mapping);
+			} else {
+				pra.referenced = 1;
+			}
+		}
+	} else {
+		rmap_walk(page, &rwc);
+	}
+
 	*vm_flags = pra.vm_flags;
 
 	if (we_locked)
@@ -1134,6 +1148,7 @@ void do_page_add_anon_rmap(struct page *page,
 {
 	bool compound = flags & RMAP_COMPOUND;
 	bool first;
+	bool success = false;
 
 	if (unlikely(PageKsm(page)))
 		lock_page_memcg(page);
@@ -1147,7 +1162,10 @@ void do_page_add_anon_rmap(struct page *page,
 		mapcount = compound_mapcount_ptr(page);
 		first = atomic_inc_and_test(mapcount);
 	} else {
-		first = atomic_inc_and_test(&page->_mapcount);
+		trace_android_vh_update_page_mapcount(page, true, compound,
+							&first, &success);
+		if (!success)
+			first = atomic_inc_and_test(&page->_mapcount);
 	}
 
 	if (first) {
@@ -1222,6 +1240,8 @@ void page_add_new_anon_rmap(struct page *page,
 void page_add_file_rmap(struct page *page, bool compound)
 {
 	int i, nr = 1;
+	bool first_mapping;
+	bool success = false;
 
 	VM_BUG_ON_PAGE(compound && !PageTransHuge(page), page);
 	lock_page_memcg(page);
@@ -1229,8 +1249,15 @@ void page_add_file_rmap(struct page *page, bool compound)
 		int nr_pages = thp_nr_pages(page);
 
 		for (i = 0, nr = 0; i < nr_pages; i++) {
-			if (atomic_inc_and_test(&page[i]._mapcount))
-				nr++;
+			trace_android_vh_update_page_mapcount(&page[i], true,
+					compound, &first_mapping, &success);
+			if ((success)) {
+				if (first_mapping)
+					nr++;
+			} else {
+				if (atomic_inc_and_test(&page[i]._mapcount))
+					nr++;
+			}
 		}
 		if (!atomic_inc_and_test(compound_mapcount_ptr(page)))
 			goto out;
@@ -1250,8 +1277,15 @@ void page_add_file_rmap(struct page *page, bool compound)
 			if (PageMlocked(page))
 				clear_page_mlock(head);
 		}
-		if (!atomic_inc_and_test(&page->_mapcount))
-			goto out;
+		trace_android_vh_update_page_mapcount(page, true,
+					compound, &first_mapping, &success);
+		if (success) {
+			if (!first_mapping)
+				goto out;
+		} else {
+			if (!atomic_inc_and_test(&page->_mapcount))
+				goto out;
+		}
 	}
 	__mod_lruvec_page_state(page, NR_FILE_MAPPED, nr);
 out:
@@ -1261,6 +1295,8 @@ out:
 static void page_remove_file_rmap(struct page *page, bool compound)
 {
 	int i, nr = 1;
+	bool first_mapping;
+	bool success = false;
 
 	VM_BUG_ON_PAGE(compound && !PageHead(page), page);
 
@@ -1276,8 +1312,15 @@ static void page_remove_file_rmap(struct page *page, bool compound)
 		int nr_pages = thp_nr_pages(page);
 
 		for (i = 0, nr = 0; i < nr_pages; i++) {
-			if (atomic_add_negative(-1, &page[i]._mapcount))
-				nr++;
+			trace_android_vh_update_page_mapcount(&page[i], false,
+						compound, &first_mapping, &success);
+			if (success) {
+				if (first_mapping)
+					nr++;
+			} else {
+				if (atomic_add_negative(-1, &page[i]._mapcount))
+					nr++;
+			}
 		}
 		if (!atomic_add_negative(-1, compound_mapcount_ptr(page)))
 			return;
@@ -1288,8 +1331,15 @@ static void page_remove_file_rmap(struct page *page, bool compound)
 			__mod_lruvec_page_state(page, NR_FILE_PMDMAPPED,
 						-nr_pages);
 	} else {
-		if (!atomic_add_negative(-1, &page->_mapcount))
-			return;
+		trace_android_vh_update_page_mapcount(page, false,
+					compound, &first_mapping, &success);
+		if (success) {
+			if (!first_mapping)
+				return;
+		} else {
+			if (!atomic_add_negative(-1, &page->_mapcount))
+				return;
+		}
 	}
 
 	/*
@@ -1306,6 +1356,8 @@ static void page_remove_file_rmap(struct page *page, bool compound)
 static void page_remove_anon_compound_rmap(struct page *page)
 {
 	int i, nr;
+	bool first_mapping;
+	bool success = false;
 
 	if (!atomic_add_negative(-1, compound_mapcount_ptr(page)))
 		return;
@@ -1325,8 +1377,15 @@ static void page_remove_anon_compound_rmap(struct page *page)
 		 * them are still mapped.
 		 */
 		for (i = 0, nr = 0; i < thp_nr_pages(page); i++) {
-			if (atomic_add_negative(-1, &page[i]._mapcount))
-				nr++;
+			trace_android_vh_update_page_mapcount(&page[i], false,
+					false, &first_mapping, &success);
+			if (success) {
+				if (first_mapping)
+					nr++;
+			} else {
+				if (atomic_add_negative(-1, &page[i]._mapcount))
+					nr++;
+			}
 		}
 
 		/*
@@ -1356,6 +1415,8 @@ static void page_remove_anon_compound_rmap(struct page *page)
  */
 void page_remove_rmap(struct page *page, bool compound)
 {
+	bool first_mapping;
+	bool success = false;
 	lock_page_memcg(page);
 
 	if (!PageAnon(page)) {
@@ -1368,10 +1429,16 @@ void page_remove_rmap(struct page *page, bool compound)
 		goto out;
 	}
 
-	/* page still mapped by someone else? */
-	if (!atomic_add_negative(-1, &page->_mapcount))
-		goto out;
-
+	trace_android_vh_update_page_mapcount(page, false,
+					compound, &first_mapping, &success);
+	if (success) {
+		if (!first_mapping)
+			goto out;
+	} else {
+		/* page still mapped by someone else? */
+		if (!atomic_add_negative(-1, &page->_mapcount))
+			goto out;
+	}
 	/*
 	 * We use the irq-unsafe __{inc|mod}_zone_page_stat because
 	 * these counters are not modified in interrupt context, and
@@ -1715,6 +1782,8 @@ void try_to_unmap(struct page *page, enum ttu_flags flags)
 
 	if (flags & TTU_RMAP_LOCKED)
 		rmap_walk_locked(page, &rwc);
+	else if (flags & TTU_RMAP_TRY_LOCK)
+		rmap_walk_trylock(page, &rwc);
 	else
 		rmap_walk(page, &rwc);
 }
@@ -2353,7 +2422,7 @@ static void rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc,
  * LOCKED.
  */
 static void rmap_walk_file(struct page *page, struct rmap_walk_control *rwc,
-		bool locked)
+		bool locked, bool trylock)
 {
 	struct address_space *mapping = page_mapping(page);
 	pgoff_t pgoff_start, pgoff_end;
@@ -2372,8 +2441,15 @@ static void rmap_walk_file(struct page *page, struct rmap_walk_control *rwc,
 
 	pgoff_start = page_to_pgoff(page);
 	pgoff_end = pgoff_start + thp_nr_pages(page) - 1;
-	if (!locked)
-		i_mmap_lock_read(mapping);
+
+	if (!locked) {
+		if (trylock) {
+			if (!i_mmap_trylock_read(mapping))
+				return;
+		} else {
+			i_mmap_lock_read(mapping);
+		}
+	}
 	vma_interval_tree_foreach(vma, &mapping->i_mmap,
 			pgoff_start, pgoff_end) {
 		unsigned long address = vma_address(page, vma);
@@ -2402,7 +2478,17 @@ void rmap_walk(struct page *page, struct rmap_walk_control *rwc)
 	else if (PageAnon(page))
 		rmap_walk_anon(page, rwc, false);
 	else
-		rmap_walk_file(page, rwc, false);
+		rmap_walk_file(page, rwc, false, false);
+}
+
+void rmap_walk_trylock(struct page *page, struct rmap_walk_control *rwc)
+{
+	if (unlikely(PageKsm(page)))
+		rmap_walk_ksm(page, rwc);
+	else if (PageAnon(page))
+		rmap_walk_anon(page, rwc, false);
+	else
+		rmap_walk_file(page, rwc, false, true);
 }
 
 /* Like rmap_walk, but caller holds relevant rmap lock */
@@ -2413,7 +2499,7 @@ void rmap_walk_locked(struct page *page, struct rmap_walk_control *rwc)
 	if (PageAnon(page))
 		rmap_walk_anon(page, rwc, true);
 	else
-		rmap_walk_file(page, rwc, true);
+		rmap_walk_file(page, rwc, true, false);
 }
 
 #ifdef CONFIG_HUGETLB_PAGE
