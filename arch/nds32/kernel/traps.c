@@ -141,7 +141,7 @@ void die(const char *str, struct pt_regs *regs, int err)
 
 	bust_spinlocks(0);
 	spin_unlock_irq(&die_lock);
-	make_task_dead(SIGSEGV);
+	do_exit(SIGSEGV);
 }
 
 EXPORT_SYMBOL(die);
@@ -240,7 +240,7 @@ void unhandled_interruption(struct pt_regs *regs)
 	pr_emerg("unhandled_interruption\n");
 	show_regs(regs);
 	if (!user_mode(regs))
-		make_task_dead(SIGKILL);
+		do_exit(SIGKILL);
 	force_sig(SIGKILL);
 }
 
@@ -251,7 +251,7 @@ void unhandled_exceptions(unsigned long entry, unsigned long addr,
 		 addr, type);
 	show_regs(regs);
 	if (!user_mode(regs))
-		make_task_dead(SIGKILL);
+		do_exit(SIGKILL);
 	force_sig(SIGKILL);
 }
 
@@ -278,7 +278,7 @@ void do_revinsn(struct pt_regs *regs)
 	pr_emerg("Reserved Instruction\n");
 	show_regs(regs);
 	if (!user_mode(regs))
-		make_task_dead(SIGILL);
+		do_exit(SIGILL);
 	force_sig(SIGILL);
 }
 

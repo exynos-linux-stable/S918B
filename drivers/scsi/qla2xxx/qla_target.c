@@ -2166,10 +2166,8 @@ static int __qlt_24xx_handle_abts(struct scsi_qla_host *vha,
 
 	abort_cmd = ha->tgt.tgt_ops->find_cmd_by_tag(sess,
 				le32_to_cpu(abts->exchange_addr_to_abort));
-	if (!abort_cmd) {
-		mempool_free(mcmd, qla_tgt_mgmt_cmd_mempool);
+	if (!abort_cmd)
 		return -EIO;
-	}
 	mcmd->unpacked_lun = abort_cmd->se_cmd.orig_fe_lun;
 
 	if (abort_cmd->qpair) {
@@ -3839,9 +3837,6 @@ int qlt_abort_cmd(struct qla_tgt_cmd *cmd)
 
 	spin_lock_irqsave(&cmd->cmd_lock, flags);
 	if (cmd->aborted) {
-		if (cmd->sg_mapped)
-			qlt_unmap_sg(vha, cmd);
-
 		spin_unlock_irqrestore(&cmd->cmd_lock, flags);
 		/*
 		 * It's normal to see 2 calls in this path:
@@ -4817,7 +4812,7 @@ static int qlt_handle_login(struct scsi_qla_host *vha,
 	}
 
 	if (vha->hw->flags.edif_enabled) {
-		if (DBELL_INACTIVE(vha)) {
+		if (!(vha->e_dbell.db_flags & EDB_ACTIVE)) {
 			ql_dbg(ql_dbg_disc, vha, 0xffff,
 			       "%s %d Term INOT due to app not started lid=%d, NportID %06X ",
 			       __func__, __LINE__, loop_id, port_id.b24);
@@ -6963,8 +6958,14 @@ qlt_24xx_config_rings(struct scsi_qla_host *vha)
 
 	if (ha->flags.msix_enabled) {
 		if (IS_QLA83XX(ha) || IS_QLA27XX(ha) || IS_QLA28XX(ha)) {
-			icb->msix_atio = cpu_to_le16(msix->entry);
-			icb->firmware_options_2 &= cpu_to_le32(~BIT_26);
+			if (IS_QLA2071(ha)) {
+				/* 4 ports Baker: Enable Interrupt Handshake */
+				icb->msix_atio = 0;
+				icb->firmware_options_2 |= cpu_to_le32(BIT_26);
+			} else {
+				icb->msix_atio = cpu_to_le16(msix->entry);
+				icb->firmware_options_2 &= cpu_to_le32(~BIT_26);
+			}
 			ql_dbg(ql_dbg_init, vha, 0xf072,
 			    "Registering ICB vector 0x%x for atio que.\n",
 			    msix->entry);

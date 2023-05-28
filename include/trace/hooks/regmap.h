@@ -8,13 +8,10 @@
 #define _TRACE_HOOK_REGMAP_H
 #include <trace/hooks/vendor_hooks.h>
 
-#ifdef __GENKSYMS__
+/* struct regmap */
 #include <../drivers/base/regmap/internal.h>
+/* struct regmap_config */
 #include <linux/regmap.h>
-#endif
-
-struct regmap;
-struct regmap_config;
 
 /*
  * Following tracepoints are not exported in tracefs and provide a

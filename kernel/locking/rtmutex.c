@@ -856,9 +856,8 @@ static int __sched rt_mutex_adjust_prio_chain(struct task_struct *task,
 		 * then we need to wake the new top waiter up to try
 		 * to get the lock.
 		 */
-		top_waiter = rt_mutex_top_waiter(lock);
-		if (prerequeue_top_waiter != top_waiter)
-			wake_up_state(top_waiter->task, top_waiter->wake_state);
+		if (prerequeue_top_waiter != rt_mutex_top_waiter(lock))
+			wake_up_state(waiter->task, waiter->wake_state);
 		raw_spin_unlock_irq(&lock->wait_lock);
 		return 0;
 	}

@@ -656,15 +656,9 @@ cifs_show_options(struct seq_file *s, struct dentry *root)
 	seq_printf(s, ",echo_interval=%lu",
 			tcon->ses->server->echo_interval / HZ);
 
-	/* Only display the following if overridden on mount */
+	/* Only display max_credits if it was overridden on mount */
 	if (tcon->ses->server->max_credits != SMB2_MAX_CREDITS_AVAILABLE)
 		seq_printf(s, ",max_credits=%u", tcon->ses->server->max_credits);
-	if (tcon->ses->server->tcp_nodelay)
-		seq_puts(s, ",tcpnodelay");
-	if (tcon->ses->server->noautotune)
-		seq_puts(s, ",noautotune");
-	if (tcon->ses->server->noblocksnd)
-		seq_puts(s, ",noblocksend");
 
 	if (tcon->snapshot_time)
 		seq_printf(s, ",snapshot=%llu", tcon->snapshot_time);
@@ -832,7 +826,7 @@ cifs_smb3_do_mount(struct file_system_type *fs_type,
 	      int flags, struct smb3_fs_context *old_ctx)
 {
 	int rc;
-	struct super_block *sb = NULL;
+	struct super_block *sb;
 	struct cifs_sb_info *cifs_sb = NULL;
 	struct cifs_mnt_data mnt_data;
 	struct dentry *root;
@@ -928,11 +922,9 @@ out_super:
 	return root;
 out:
 	if (cifs_sb) {
-		if (!sb || IS_ERR(sb)) {  /* otherwise kill_sb will handle */
-			kfree(cifs_sb->prepath);
-			smb3_cleanup_fs_context(cifs_sb->ctx);
-			kfree(cifs_sb);
-		}
+		kfree(cifs_sb->prepath);
+		smb3_cleanup_fs_context(cifs_sb->ctx);
+		kfree(cifs_sb);
 	}
 	return root;
 }
@@ -1080,7 +1072,7 @@ struct file_system_type cifs_fs_type = {
 };
 MODULE_ALIAS_FS("cifs");
 
-struct file_system_type smb3_fs_type = {
+static struct file_system_type smb3_fs_type = {
 	.owner = THIS_MODULE,
 	.name = "smb3",
 	.init_fs_context = smb3_init_fs_context,
@@ -1269,11 +1261,8 @@ static ssize_t cifs_copy_file_range(struct file *src_file, loff_t off,
 	ssize_t rc;
 	struct cifsFileInfo *cfile = dst_file->private_data;
 
-	if (cfile->swapfile) {
-		rc = -EOPNOTSUPP;
-		free_xid(xid);
-		return rc;
-	}
+	if (cfile->swapfile)
+		return -EOPNOTSUPP;
 
 	rc = cifs_file_copychunk_range(xid, src_file, off, dst_file, destoff,
 					len, flags);

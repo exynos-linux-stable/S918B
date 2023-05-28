@@ -1746,7 +1746,7 @@ static u32 fuse_to_supp_hw(struct device *dev, struct adreno_rev rev, u32 fuse)
 
 	if (val == UINT_MAX) {
 		DRM_DEV_ERROR(dev,
-			"missing support for speed-bin: %u. Some OPPs may not be supported by hardware\n",
+			"missing support for speed-bin: %u. Some OPPs may not be supported by hardware",
 			fuse);
 		return UINT_MAX;
 	}
@@ -1756,7 +1756,7 @@ static u32 fuse_to_supp_hw(struct device *dev, struct adreno_rev rev, u32 fuse)
 
 static int a6xx_set_supported_hw(struct device *dev, struct adreno_rev rev)
 {
-	u32 supp_hw;
+	u32 supp_hw = UINT_MAX;
 	u32 speedbin;
 	int ret;
 
@@ -1768,13 +1768,15 @@ static int a6xx_set_supported_hw(struct device *dev, struct adreno_rev rev)
 	if (ret == -ENOENT) {
 		return 0;
 	} else if (ret) {
-		dev_err_probe(dev, ret,
-			      "failed to read speed-bin. Some OPPs may not be supported by hardware\n");
-		return ret;
+		DRM_DEV_ERROR(dev,
+			      "failed to read speed-bin (%d). Some OPPs may not be supported by hardware",
+			      ret);
+		goto done;
 	}
 
 	supp_hw = fuse_to_supp_hw(dev, rev, speedbin);
 
+done:
 	ret = devm_pm_opp_set_supported_hw(dev, &supp_hw, 1);
 	if (ret)
 		return ret;
@@ -1870,7 +1872,6 @@ struct msm_gpu *a6xx_gpu_init(struct drm_device *dev)
 	BUG_ON(!node);
 
 	ret = a6xx_gmu_init(a6xx_gpu, node);
-	of_node_put(node);
 	if (ret) {
 		a6xx_destroy(&(a6xx_gpu->base.base));
 		return ERR_PTR(ret);

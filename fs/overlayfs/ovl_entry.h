@@ -130,7 +130,7 @@ struct ovl_inode {
 	unsigned long flags;
 	struct inode vfs_inode;
 	struct dentry *__upperdentry;
-	struct ovl_path lowerpath;
+	struct inode *lower;
 
 	/* synchronize copy up and more */
 	struct mutex lock;

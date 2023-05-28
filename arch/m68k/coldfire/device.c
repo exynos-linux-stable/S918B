@@ -581,7 +581,7 @@ static struct platform_device mcf_esdhc = {
 };
 #endif /* MCFSDHC_BASE */
 
-#ifdef MCFFLEXCAN_SIZE
+#if IS_ENABLED(CONFIG_CAN_FLEXCAN)
 
 #include <linux/can/platform/flexcan.h>
 
@@ -620,7 +620,7 @@ static struct platform_device mcf_flexcan0 = {
 	.resource = mcf5441x_flexcan0_resource,
 	.dev.platform_data = &mcf5441x_flexcan_info,
 };
-#endif /* MCFFLEXCAN_SIZE */
+#endif /* IS_ENABLED(CONFIG_CAN_FLEXCAN) */
 
 static struct platform_device *mcf_devices[] __initdata = {
 	&mcf_uart,
@@ -657,7 +657,7 @@ static struct platform_device *mcf_devices[] __initdata = {
 #ifdef MCFSDHC_BASE
 	&mcf_esdhc,
 #endif
-#ifdef MCFFLEXCAN_SIZE
+#if IS_ENABLED(CONFIG_CAN_FLEXCAN)
 	&mcf_flexcan0,
 #endif
 };

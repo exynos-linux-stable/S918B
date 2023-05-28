@@ -479,8 +479,6 @@ struct request *blk_mq_alloc_request_hctx(struct request_queue *q,
 	if (!blk_mq_hw_queue_mapped(data.hctx))
 		goto out_queue_exit;
 	cpu = cpumask_first_and(data.hctx->cpumask, cpu_online_mask);
-	if (cpu >= nr_cpu_ids)
-		goto out_queue_exit;
 	data.ctx = __blk_mq_get_ctx(q, cpu);
 
 	if (!q->elevator)
@@ -631,17 +629,22 @@ static inline bool blk_mq_complete_need_ipi(struct request *rq)
 	return cpu_online(rq->mq_ctx->cpu);
 }
 
-static void blk_mq_complete_send_ipi(struct request *rq)
+static int blk_mq_complete_send_ipi(struct request *rq)
 {
 	struct llist_head *list;
 	unsigned int cpu;
+	int ret = 0;
 
 	cpu = rq->mq_ctx->cpu;
 	list = &per_cpu(blk_cpu_done, cpu);
 	if (llist_add(&rq->ipi_list, list)) {
 		INIT_CSD(&rq->csd, __blk_mq_complete_request_remote, rq);
-		smp_call_function_single_async(cpu, &rq->csd);
+		ret = smp_call_function_single_async(cpu, &rq->csd);
+		if (ret)
+			llist_del_all(list);
 	}
+
+	return ret;
 }
 
 static void blk_mq_raise_softirq(struct request *rq)
@@ -666,10 +669,9 @@ bool blk_mq_complete_request_remote(struct request *rq)
 	if (rq->cmd_flags & REQ_HIPRI)
 		return false;
 
-	if (blk_mq_complete_need_ipi(rq)) {
-		blk_mq_complete_send_ipi(rq);
-		return true;
-	}
+	if (blk_mq_complete_need_ipi(rq))
+		if (!blk_mq_complete_send_ipi(rq))
+			return true;
 
 	if (rq->q->nr_hw_queues == 1) {
 		blk_mq_raise_softirq(rq);
@@ -1403,8 +1405,7 @@ out:
 	/* If we didn't flush the entire list, we could have told the driver
 	 * there was more coming, but that turned out to be a lie.
 	 */
-	if ((!list_empty(list) || errors || needs_resource ||
-	     ret == BLK_STS_DEV_RESOURCE) && q->mq_ops->commit_rqs && queued)
+	if ((!list_empty(list) || errors) && q->mq_ops->commit_rqs && queued)
 		q->mq_ops->commit_rqs(hctx);
 	/*
 	 * Any items that need requeuing? Stuff them into hctx->dispatch,
@@ -1648,7 +1649,8 @@ static bool blk_mq_has_sqsched(struct request_queue *q)
  */
 static struct blk_mq_hw_ctx *blk_mq_get_sq_hctx(struct request_queue *q)
 {
-	struct blk_mq_ctx *ctx = blk_mq_get_ctx(q);
+	struct blk_mq_hw_ctx *hctx;
+
 	/*
 	 * If the IO scheduler does not respect hardware queues when
 	 * dispatching, we just don't bother with multiple HW queues and
@@ -1656,8 +1658,8 @@ static struct blk_mq_hw_ctx *blk_mq_get_sq_hctx(struct request_queue *q)
 	 * just causes lock contention inside the scheduler and pointless cache
 	 * bouncing.
 	 */
-	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, 0, ctx);
-
+	hctx = blk_mq_map_queue_type(q, HCTX_TYPE_DEFAULT,
+				     raw_smp_processor_id());
 	if (!blk_mq_hctx_stopped(hctx))
 		return hctx;
 	return NULL;
@@ -2115,7 +2117,6 @@ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
 		list_del_init(&rq->queuelist);
 		ret = blk_mq_request_issue_directly(rq, list_empty(list));
 		if (ret != BLK_STS_OK) {
-			errors++;
 			if (ret == BLK_STS_RESOURCE ||
 					ret == BLK_STS_DEV_RESOURCE) {
 				blk_mq_request_bypass_insert(rq, false,
@@ -2123,6 +2124,7 @@ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
 				break;
 			}
 			blk_mq_end_request(rq, ret);
+			errors++;
 		} else
 			queued++;
 	}
@@ -2196,8 +2198,6 @@ blk_qc_t blk_mq_submit_bio(struct bio *bio)
 
 	blk_queue_bounce(q, &bio);
 	__blk_queue_split(&bio, &nr_segs);
-	if (!bio)
-		goto queue_exit;
 
 	if (!bio_integrity_prep(bio))
 		goto queue_exit;
@@ -2230,7 +2230,7 @@ blk_qc_t blk_mq_submit_bio(struct bio *bio)
 
 	blk_mq_bio_to_request(rq, bio, nr_segs);
 
-	ret = blk_crypto_rq_get_keyslot(rq);
+	ret = blk_crypto_init_request(rq);
 	if (ret != BLK_STS_OK) {
 		bio->bi_status = ret;
 		bio_endio(bio);
@@ -2466,7 +2466,7 @@ int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
 	 */
 	rq_size = round_up(sizeof(struct request) + set->cmd_size,
 				cache_line_size());
-	trace_android_vh_blk_alloc_rqs(&rq_size, set, tags, hctx_idx);
+	trace_android_vh_blk_alloc_rqs(&rq_size, set, tags);
 	left = rq_size * depth;
 
 	for (i = 0; i < depth; ) {

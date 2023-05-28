@@ -107,18 +107,18 @@ static int ntfs_read_ea(struct ntfs_inode *ni, struct EA_FULL **ea,
 		return -EFBIG;
 
 	/* Allocate memory for packed Ea. */
-	ea_p = kmalloc(size_add(size, add_bytes), GFP_NOFS);
+	ea_p = kmalloc(size + add_bytes, GFP_NOFS);
 	if (!ea_p)
 		return -ENOMEM;
 
 	if (!size) {
-		/* EA info persists, but xattr is empty. Looks like EA problem. */
+		;
 	} else if (attr_ea->non_res) {
 		struct runs_tree run;
 
 		run_init(&run);
 
-		err = attr_load_runs_range(ni, ATTR_EA, NULL, 0, &run, 0, size);
+		err = attr_load_runs(attr_ea, ni, &run, NULL);
 		if (!err)
 			err = ntfs_read_run_nb(sbi, &run, 0, ea_p, size, NULL);
 		run_close(&run);
@@ -443,11 +443,6 @@ update_ea:
 		/* Delete xattr, ATTR_EA */
 		ni_remove_attr_le(ni, attr, mi, le);
 	} else if (attr->non_res) {
-		err = attr_load_runs_range(ni, ATTR_EA, NULL, 0, &ea_run, 0,
-					   size);
-		if (err)
-			goto out;
-
 		err = ntfs_sb_write_run(sbi, &ea_run, 0, ea_all, size, 0);
 		if (err)
 			goto out;
@@ -481,7 +476,8 @@ out:
 }
 
 #ifdef CONFIG_NTFS3_FS_POSIX_ACL
-static struct posix_acl *ntfs_get_acl_ex(struct inode *inode, int type,
+static struct posix_acl *ntfs_get_acl_ex(struct user_namespace *mnt_userns,
+					 struct inode *inode, int type,
 					 int locked)
 {
 	struct ntfs_inode *ni = ntfs_i(inode);
@@ -516,7 +512,7 @@ static struct posix_acl *ntfs_get_acl_ex(struct inode *inode, int type,
 
 	/* Translate extended attribute to acl. */
 	if (err >= 0) {
-		acl = posix_acl_from_xattr(&init_user_ns, buf, err);
+		acl = posix_acl_from_xattr(mnt_userns, buf, err);
 	} else if (err == -ENODATA) {
 		acl = NULL;
 	} else {
@@ -539,32 +535,37 @@ struct posix_acl *ntfs_get_acl(struct inode *inode, int type, bool rcu)
 	if (rcu)
 		return ERR_PTR(-ECHILD);
 
-	return ntfs_get_acl_ex(inode, type, 0);
+	/* TODO: init_user_ns? */
+	return ntfs_get_acl_ex(&init_user_ns, inode, type, 0);
 }
 
 static noinline int ntfs_set_acl_ex(struct user_namespace *mnt_userns,
 				    struct inode *inode, struct posix_acl *acl,
-				    int type, bool init_acl)
+				    int type)
 {
 	const char *name;
 	size_t size, name_len;
-	void *value;
-	int err;
+	void *value = NULL;
+	int err = 0;
 	int flags;
-	umode_t mode;
 
 	if (S_ISLNK(inode->i_mode))
 		return -EOPNOTSUPP;
 
-	mode = inode->i_mode;
 	switch (type) {
 	case ACL_TYPE_ACCESS:
-		/* Do not change i_mode if we are in init_acl */
-		if (acl && !init_acl) {
+		if (acl) {
+			umode_t mode = inode->i_mode;
+
 			err = posix_acl_update_mode(mnt_userns, inode, &mode,
 						    &acl);
 			if (err)
-				return err;
+				goto out;
+
+			if (inode->i_mode != mode) {
+				inode->i_mode = mode;
+				mark_inode_dirty(inode);
+			}
 		}
 		name = XATTR_NAME_POSIX_ACL_ACCESS;
 		name_len = sizeof(XATTR_NAME_POSIX_ACL_ACCESS) - 1;
@@ -591,7 +592,7 @@ static noinline int ntfs_set_acl_ex(struct user_namespace *mnt_userns,
 		value = kmalloc(size, GFP_NOFS);
 		if (!value)
 			return -ENOMEM;
-		err = posix_acl_to_xattr(&init_user_ns, acl, value, size);
+		err = posix_acl_to_xattr(mnt_userns, acl, value, size);
 		if (err < 0)
 			goto out;
 		flags = 0;
@@ -600,13 +601,8 @@ static noinline int ntfs_set_acl_ex(struct user_namespace *mnt_userns,
 	err = ntfs_set_ea(inode, name, name_len, value, size, flags);
 	if (err == -ENODATA && !size)
 		err = 0; /* Removing non existed xattr. */
-	if (!err) {
+	if (!err)
 		set_cached_acl(inode, type, acl);
-		if (inode->i_mode != mode) {
-			inode->i_mode = mode;
-			mark_inode_dirty(inode);
-		}
-	}
 
 out:
 	kfree(value);
@@ -620,7 +616,7 @@ out:
 int ntfs_set_acl(struct user_namespace *mnt_userns, struct inode *inode,
 		 struct posix_acl *acl, int type)
 {
-	return ntfs_set_acl_ex(mnt_userns, inode, acl, type, false);
+	return ntfs_set_acl_ex(mnt_userns, inode, acl, type);
 }
 
 /*
@@ -640,7 +636,7 @@ int ntfs_init_acl(struct user_namespace *mnt_userns, struct inode *inode,
 
 	if (default_acl) {
 		err = ntfs_set_acl_ex(mnt_userns, inode, default_acl,
-				      ACL_TYPE_DEFAULT, true);
+				      ACL_TYPE_DEFAULT);
 		posix_acl_release(default_acl);
 	} else {
 		inode->i_default_acl = NULL;
@@ -651,7 +647,7 @@ int ntfs_init_acl(struct user_namespace *mnt_userns, struct inode *inode,
 	else {
 		if (!err)
 			err = ntfs_set_acl_ex(mnt_userns, inode, acl,
-					      ACL_TYPE_ACCESS, true);
+					      ACL_TYPE_ACCESS);
 		posix_acl_release(acl);
 	}
 
@@ -905,9 +901,6 @@ set_new_fa:
 	err = ntfs_set_ea(inode, name, name_len, value, size, flags);
 
 out:
-	inode->i_ctime = current_time(inode);
-	mark_inode_dirty(inode);
-
 	return err;
 }
 
@@ -988,7 +981,7 @@ static bool ntfs_xattr_user_list(struct dentry *dentry)
 }
 
 // clang-format off
-static const struct xattr_handler ntfs_other_xattr_handler = {
+static const struct xattr_handler ntfs_xattr_handler = {
 	.prefix	= "",
 	.get	= ntfs_getxattr,
 	.set	= ntfs_setxattr,
@@ -996,11 +989,7 @@ static const struct xattr_handler ntfs_other_xattr_handler = {
 };
 
 const struct xattr_handler *ntfs_xattr_handlers[] = {
-#ifdef CONFIG_NTFS3_FS_POSIX_ACL
-	&posix_acl_access_xattr_handler,
-	&posix_acl_default_xattr_handler,
-#endif
-	&ntfs_other_xattr_handler,
+	&ntfs_xattr_handler,
 	NULL,
 };
 // clang-format on

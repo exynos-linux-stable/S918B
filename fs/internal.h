@@ -45,6 +45,14 @@ int __block_write_begin_int(struct page *page, loff_t pos, unsigned len,
  */
 extern void __init chrdev_init(void);
 
+#ifdef CONFIG_PROC_DLOG
+/*
+ * dlog_hook.c
+ */
+void dlog_hook(struct dentry *, struct inode *, struct path *);
+void dlog_hook_rmdir(struct dentry *, struct path *);
+#endif
+
 /*
  * fs_context.c
  */
@@ -99,16 +107,6 @@ extern void chroot_fs_refs(const struct path *, const struct path *);
  */
 extern struct file *alloc_empty_file(int, const struct cred *);
 extern struct file *alloc_empty_file_noaccount(int, const struct cred *);
-
-static inline void put_file_access(struct file *file)
-{
-	if ((file->f_mode & (FMODE_READ | FMODE_WRITE)) == FMODE_READ) {
-		i_readcount_dec(file->f_inode);
-	} else if (file->f_mode & FMODE_WRITER) {
-		put_write_access(file->f_inode);
-		__mnt_drop_write(file->f_path.mnt);
-	}
-}
 
 /*
  * super.c
@@ -205,27 +203,3 @@ long splice_file_to_pipe(struct file *in,
 			 struct pipe_inode_info *opipe,
 			 loff_t *offset,
 			 size_t len, unsigned int flags);
-
-/*
- * fs/xattr.c:
- */
-struct xattr_name {
-	char name[XATTR_NAME_MAX + 1];
-};
-
-struct xattr_ctx {
-	/* Value of attribute */
-	union {
-		const void __user *cvalue;
-		void __user *value;
-	};
-	void *kvalue;
-	size_t size;
-	/* Attribute name */
-	struct xattr_name *kname;
-	unsigned int flags;
-};
-
-int setxattr_copy(const char __user *name, struct xattr_ctx *ctx);
-int do_setxattr(struct user_namespace *mnt_userns, struct dentry *dentry,
-		struct xattr_ctx *ctx);

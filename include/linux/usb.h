@@ -766,14 +766,11 @@ extern struct device *usb_intf_get_dma_device(struct usb_interface *intf);
 extern int usb_acpi_set_power_state(struct usb_device *hdev, int index,
 	bool enable);
 extern bool usb_acpi_power_manageable(struct usb_device *hdev, int index);
-extern int usb_acpi_port_lpm_incapable(struct usb_device *hdev, int index);
 #else
 static inline int usb_acpi_set_power_state(struct usb_device *hdev, int index,
 	bool enable) { return 0; }
 static inline bool usb_acpi_power_manageable(struct usb_device *hdev, int index)
 	{ return true; }
-static inline int usb_acpi_port_lpm_incapable(struct usb_device *hdev, int index)
-	{ return 0; }
 #endif
 
 /* USB autosuspend and autoresume */
@@ -2065,6 +2062,19 @@ enum usb_led_event {
 	USB_LED_EVENT_HOST = 0,
 	USB_LED_EVENT_GADGET = 1,
 };
+
+#if IS_ENABLED(CONFIG_USB_HOST_CERTIFICATION)
+/* USB certification */
+enum usb_host_certi_type {
+	USB_HOST_CERTI_UNSUPPORT_ACCESSORY,
+	USB_HOST_CERTI_NO_RESPONSE,
+	USB_HOST_CERTI_HUB_DEPTH_EXCEED,
+	USB_HOST_CERTI_HUB_POWER_EXCEED,
+	USB_HOST_CERTI_HOST_RESOURCE_EXCEED,
+	USB_HOST_CERTI_WARM_RESET
+};
+extern void send_usb_host_certi_uevent(struct device *dev, int usb_certi);
+#endif
 
 #ifdef CONFIG_USB_LED_TRIG
 extern void usb_led_activity(enum usb_led_event ev);

@@ -96,7 +96,6 @@ static int gpy_config_init(struct phy_device *phydev)
 
 static int gpy_probe(struct phy_device *phydev)
 {
-	int fw_version;
 	int ret;
 
 	if (!phydev->is_c45) {
@@ -106,12 +105,12 @@ static int gpy_probe(struct phy_device *phydev)
 	}
 
 	/* Show GPY PHY FW version in dmesg */
-	fw_version = phy_read(phydev, PHY_FWV);
-	if (fw_version < 0)
-		return fw_version;
+	ret = phy_read(phydev, PHY_FWV);
+	if (ret < 0)
+		return ret;
 
-	phydev_info(phydev, "Firmware Version: 0x%04X (%s)\n", fw_version,
-		    (fw_version & PHY_FWV_REL_MASK) ? "release" : "test");
+	phydev_info(phydev, "Firmware Version: 0x%04X (%s)\n", ret,
+		    (ret & PHY_FWV_REL_MASK) ? "release" : "test");
 
 	return 0;
 }

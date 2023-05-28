@@ -21,6 +21,10 @@
 
 #include "bpf_jit.h"
 
+#ifdef CONFIG_RKP
+#include <linux/rkp.h>
+#endif
+
 #define TMP_REG_1 (MAX_BPF_JIT_REG + 0)
 #define TMP_REG_2 (MAX_BPF_JIT_REG + 1)
 #define TCALL_CNT (MAX_BPF_JIT_REG + 2)
@@ -788,10 +792,7 @@ emit_cond_jmp:
 		u64 imm64;
 
 		imm64 = (u64)insn1.imm << 32 | (u32)imm;
-		if (bpf_pseudo_func(insn))
-			emit_addr_mov_i64(dst, imm64, ctx);
-		else
-			emit_a64_mov_i64(dst, imm64, ctx);
+		emit_a64_mov_i64(dst, imm64, ctx);
 
 		return 1;
 	}
@@ -1116,7 +1117,6 @@ skip_init_ctx:
 			bpf_jit_binary_free(header);
 			prog->bpf_func = NULL;
 			prog->jited = 0;
-			prog->jited_len = 0;
 			goto out_off;
 		}
 		bpf_jit_binary_lock_ro(header);
@@ -1128,6 +1128,9 @@ skip_init_ctx:
 	prog->bpf_func = (void *)ctx.image;
 	prog->jited = 1;
 	prog->jited_len = prog_size;
+#ifdef CONFIG_RKP
+	uh_call(UH_APP_RKP, RKP_BPF_LOAD, (u64)header, (u64)(header->pages * PAGE_SIZE), 0, 0);
+#endif
 
 	if (!prog->is_func || extra_pass) {
 		int i;

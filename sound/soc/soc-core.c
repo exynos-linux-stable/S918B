@@ -876,7 +876,7 @@ static int soc_dai_link_sanity_check(struct snd_soc_card *card,
 		 * component list.
 		 */
 		if (!soc_find_component(codec)) {
-			dev_dbg(card->dev,
+			dev_err(card->dev,
 				"ASoC: codec component %s not found for link %s\n",
 				codec->name, link->name);
 			return -EPROBE_DEFER;
@@ -901,7 +901,7 @@ static int soc_dai_link_sanity_check(struct snd_soc_card *card,
 		 * component list.
 		 */
 		if (!soc_find_component(platform)) {
-			dev_dbg(card->dev,
+			dev_err(card->dev,
 				"ASoC: platform component %s not found for link %s\n",
 				platform->name, link->name);
 			return -EPROBE_DEFER;
@@ -927,7 +927,7 @@ static int soc_dai_link_sanity_check(struct snd_soc_card *card,
 		 */
 		if ((cpu->of_node || cpu->name) &&
 		    !soc_find_component(cpu)) {
-			dev_dbg(card->dev,
+			dev_err(card->dev,
 				"ASoC: cpu component %s not found for link %s\n",
 				cpu->name, link->name);
 			return -EPROBE_DEFER;
@@ -3399,23 +3399,10 @@ EXPORT_SYMBOL_GPL(snd_soc_of_get_dai_link_codecs);
 
 static int __init snd_soc_init(void)
 {
-	int ret;
-
 	snd_soc_debugfs_init();
-	ret = snd_soc_util_init();
-	if (ret)
-		goto err_util_init;
+	snd_soc_util_init();
 
-	ret = platform_driver_register(&soc_driver);
-	if (ret)
-		goto err_register;
-	return 0;
-
-err_register:
-	snd_soc_util_exit();
-err_util_init:
-	snd_soc_debugfs_exit();
-	return ret;
+	return platform_driver_register(&soc_driver);
 }
 module_init(snd_soc_init);
 

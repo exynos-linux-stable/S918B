@@ -299,9 +299,6 @@ int snd_usb_audioformat_set_sync_ep(struct snd_usb_audio *chip,
 	bool is_playback;
 	int err;
 
-	if (fmt->sync_ep)
-		return 0; /* already set up */
-
 	alts = snd_usb_get_host_interface(chip, fmt->iface, fmt->altsetting);
 	if (!alts)
 		return 0;
@@ -315,7 +312,7 @@ int snd_usb_audioformat_set_sync_ep(struct snd_usb_audio *chip,
 	 * Generic sync EP handling
 	 */
 
-	if (fmt->ep_idx > 0 || altsd->bNumEndpoints < 2)
+	if (altsd->bNumEndpoints < 2)
 		return 0;
 
 	is_playback = !(get_endpoint(alts, 0)->bEndpointAddress & USB_DIR_IN);
@@ -450,21 +447,16 @@ static int configure_endpoints(struct snd_usb_audio *chip,
 		/* stop any running stream beforehand */
 		if (stop_endpoints(subs, false))
 			sync_pending_stops(subs);
-		if (subs->sync_endpoint) {
-			err = snd_usb_endpoint_configure(chip, subs->sync_endpoint);
-			if (err < 0)
-				return err;
-		}
 		err = snd_usb_endpoint_configure(chip, subs->data_endpoint);
 		if (err < 0)
 			return err;
 		snd_usb_set_format_quirk(subs, subs->cur_audiofmt);
-	} else {
-		if (subs->sync_endpoint) {
-			err = snd_usb_endpoint_configure(chip, subs->sync_endpoint);
-			if (err < 0)
-				return err;
-		}
+	}
+
+	if (subs->sync_endpoint) {
+		err = snd_usb_endpoint_configure(chip, subs->sync_endpoint);
+		if (err < 0)
+			return err;
 	}
 
 	return 0;
@@ -533,8 +525,6 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
 		if (snd_usb_endpoint_compatible(chip, subs->data_endpoint,
 						fmt, hw_params))
 			goto unlock;
-		if (stop_endpoints(subs, false))
-			sync_pending_stops(subs);
 		close_endpoints(chip, subs);
 	}
 
@@ -917,13 +907,8 @@ get_sync_ep_from_substream(struct snd_usb_substream *subs)
 			continue;
 		/* for the implicit fb, check the sync ep as well */
 		ep = snd_usb_get_endpoint(chip, fp->sync_ep);
-		if (ep && ep->cur_audiofmt) {
-			/* ditto, if the sync (data) ep is used by others,
-			 * this stream is restricted by the sync ep
-			 */
-			if (ep != subs->sync_endpoint || ep->opened > 1)
-				return ep;
-		}
+		if (ep && ep->cur_audiofmt)
+			return ep;
 	}
 	return NULL;
 }

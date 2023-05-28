@@ -214,11 +214,10 @@ static void gic_do_wait_for_rwp(void __iomem *base, u32 bit)
 }
 
 /* Wait for completion of a distributor change */
-void gic_dist_wait_for_rwp(void)
+static void gic_dist_wait_for_rwp(void)
 {
 	gic_do_wait_for_rwp(gic_data.dist_base, GICD_CTLR_RWP);
 }
-EXPORT_SYMBOL_GPL(gic_dist_wait_for_rwp);
 
 /* Wait for completion of a redistributor change */
 static void gic_redist_wait_for_rwp(void)
@@ -549,8 +548,7 @@ static void gic_irq_nmi_teardown(struct irq_data *d)
 
 static void gic_eoi_irq(struct irq_data *d)
 {
-	write_gicreg(gic_irq(d), ICC_EOIR1_EL1);
-	isb();
+	gic_write_eoir(gic_irq(d));
 }
 
 static void gic_eoimode1_eoi_irq(struct irq_data *d)
@@ -634,36 +632,8 @@ static void gic_deactivate_unhandled(u32 irqnr)
 		if (irqnr < 8192)
 			gic_write_dir(irqnr);
 	} else {
-		write_gicreg(irqnr, ICC_EOIR1_EL1);
-		isb();
+		gic_write_eoir(irqnr);
 	}
-}
-
-/*
- * Follow a read of the IAR with any HW maintenance that needs to happen prior
- * to invoking the relevant IRQ handler. We must do two things:
- *
- * (1) Ensure instruction ordering between a read of IAR and subsequent
- *     instructions in the IRQ handler using an ISB.
- *
- *     It is possible for the IAR to report an IRQ which was signalled *after*
- *     the CPU took an IRQ exception as multiple interrupts can race to be
- *     recognized by the GIC, earlier interrupts could be withdrawn, and/or
- *     later interrupts could be prioritized by the GIC.
- *
- *     For devices which are tightly coupled to the CPU, such as PMUs, a
- *     context synchronization event is necessary to ensure that system
- *     register state is not stale, as these may have been indirectly written
- *     *after* exception entry.
- *
- * (2) Deactivate the interrupt when EOI mode 1 is in use.
- */
-static inline void gic_complete_ack(u32 irqnr)
-{
-	if (static_branch_likely(&supports_deactivate_key))
-		write_gicreg(irqnr, ICC_EOIR1_EL1);
-
-	isb();
 }
 
 static inline void gic_handle_nmi(u32 irqnr, struct pt_regs *regs)
@@ -674,8 +644,8 @@ static inline void gic_handle_nmi(u32 irqnr, struct pt_regs *regs)
 	if (irqs_enabled)
 		nmi_enter();
 
-	gic_complete_ack(irqnr);
-
+	if (static_branch_likely(&supports_deactivate_key))
+		gic_write_eoir(irqnr);
 	/*
 	 * Leave the PSR.I bit set to prevent other NMIs to be
 	 * received while handling this one.
@@ -745,7 +715,10 @@ static asmlinkage void __exception_irq_entry gic_handle_irq(struct pt_regs *regs
 		gic_arch_enable_irqs();
 	}
 
-	gic_complete_ack(irqnr);
+	if (static_branch_likely(&supports_deactivate_key))
+		gic_write_eoir(irqnr);
+	else
+		isb();
 
 	if (handle_domain_irq(gic_data.domain, irqnr, regs)) {
 		WARN_ONCE(true, "Unexpected interrupt received!\n");
@@ -792,7 +765,7 @@ static bool gic_has_group0(void)
 	return val != 0;
 }
 
-void gic_dist_init(void)
+static void __init gic_dist_init(void)
 {
 	unsigned int i;
 	u64 affinity;
@@ -854,7 +827,6 @@ void gic_dist_init(void)
 		gic_write_irouter(affinity, base + GICD_IROUTERnE + i * 8);
 	}
 }
-EXPORT_SYMBOL_GPL(gic_dist_init);
 
 static int gic_iterate_rdists(int (*fn)(struct redist_region *, void __iomem *))
 {
@@ -1136,7 +1108,7 @@ static int gic_dist_supports_lpis(void)
 		!gicv3_nolpi);
 }
 
-void gic_cpu_init(void)
+static void gic_cpu_init(void)
 {
 	void __iomem *rbase;
 	int i;
@@ -1163,7 +1135,6 @@ void gic_cpu_init(void)
 	/* initialise system registers */
 	gic_cpu_sys_reg_init();
 }
-EXPORT_SYMBOL_GPL(gic_cpu_init);
 
 #ifdef CONFIG_SMP
 
@@ -1366,15 +1337,8 @@ void gic_resume(void)
 }
 EXPORT_SYMBOL_GPL(gic_resume);
 
-static int gic_suspend(void)
-{
-	trace_android_vh_gic_suspend(&gic_data);
-	return 0;
-}
-
 static struct syscore_ops gic_syscore_ops = {
 	.resume = gic_resume,
-	.suspend = gic_suspend,
 };
 
 static void gic_syscore_init(void)
@@ -1385,7 +1349,6 @@ static void gic_syscore_init(void)
 #else
 static inline void gic_syscore_init(void) { }
 void gic_resume(void) { }
-static inline int gic_suspend(void) { return 0; }
 #endif
 
 
@@ -1924,7 +1887,7 @@ static void __init gic_populate_ppi_partitions(struct device_node *gic_node)
 
 	gic_data.ppi_descs = kcalloc(gic_data.ppi_nr, sizeof(*gic_data.ppi_descs), GFP_KERNEL);
 	if (!gic_data.ppi_descs)
-		goto out_put_node;
+		return;
 
 	nr_parts = of_get_child_count(parts_node);
 
@@ -1965,15 +1928,12 @@ static void __init gic_populate_ppi_partitions(struct device_node *gic_node)
 				continue;
 
 			cpu = of_cpu_node_to_id(cpu_node);
-			if (WARN_ON(cpu < 0)) {
-				of_node_put(cpu_node);
+			if (WARN_ON(cpu < 0))
 				continue;
-			}
 
 			pr_cont("%pOF[%d] ", cpu_node, cpu);
 
 			cpumask_set_cpu(cpu, &part->mask);
-			of_node_put(cpu_node);
 		}
 
 		pr_cont("}\n");

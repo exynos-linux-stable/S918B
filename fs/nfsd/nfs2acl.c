@@ -246,27 +246,37 @@ static int nfsaclsvc_encode_getaclres(struct svc_rqst *rqstp, __be32 *p)
 	struct nfsd3_getaclres *resp = rqstp->rq_resp;
 	struct dentry *dentry = resp->fh.fh_dentry;
 	struct inode *inode;
+	int w;
 
 	if (!svcxdr_encode_stat(xdr, resp->status))
-		return false;
+		return 0;
 
 	if (dentry == NULL || d_really_is_negative(dentry))
-		return true;
+		return 1;
 	inode = d_inode(dentry);
 
 	if (!svcxdr_encode_fattr(rqstp, xdr, &resp->fh, &resp->stat))
-		return false;
+		return 0;
 	if (xdr_stream_encode_u32(xdr, resp->mask) < 0)
-		return false;
+		return 0;
+
+	rqstp->rq_res.page_len = w = nfsacl_size(
+		(resp->mask & NFS_ACL)   ? resp->acl_access  : NULL,
+		(resp->mask & NFS_DFACL) ? resp->acl_default : NULL);
+	while (w > 0) {
+		if (!*(rqstp->rq_next_page++))
+			return 1;
+		w -= PAGE_SIZE;
+	}
 
 	if (!nfs_stream_encode_acl(xdr, inode, resp->acl_access,
 				   resp->mask & NFS_ACL, 0))
-		return false;
+		return 0;
 	if (!nfs_stream_encode_acl(xdr, inode, resp->acl_default,
 				   resp->mask & NFS_DFACL, NFS_ACL_DEFAULT))
-		return false;
+		return 0;
 
-	return true;
+	return 1;
 }
 
 /* ACCESS */
@@ -276,17 +286,17 @@ static int nfsaclsvc_encode_accessres(struct svc_rqst *rqstp, __be32 *p)
 	struct nfsd3_accessres *resp = rqstp->rq_resp;
 
 	if (!svcxdr_encode_stat(xdr, resp->status))
-		return false;
+		return 0;
 	switch (resp->status) {
 	case nfs_ok:
 		if (!svcxdr_encode_fattr(rqstp, xdr, &resp->fh, &resp->stat))
-			return false;
+			return 0;
 		if (xdr_stream_encode_u32(xdr, resp->access) < 0)
-			return false;
+			return 0;
 		break;
 	}
 
-	return true;
+	return 1;
 }
 
 /*

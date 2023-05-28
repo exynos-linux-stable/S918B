@@ -226,7 +226,6 @@ config ARM64
 	select THREAD_INFO_IN_TASK
 	select HAVE_ARCH_USERFAULTFD_MINOR if USERFAULTFD
 	select TRACE_IRQFLAGS_SUPPORT
-	select TRACE_IRQFLAGS_NMI_SUPPORT
 	select ARCH_SUPPORTS_SPECULATIVE_PAGE_FAULT
 	help
 	  ARM 64-bit (AArch64) Linux support.
@@ -603,23 +602,6 @@ config ARM64_ERRATUM_1530923
 config ARM64_WORKAROUND_REPEAT_TLBI
 	bool
 
-config ARM64_ERRATUM_2441007
-	bool "Cortex-A55: Completion of affected memory accesses might not be guaranteed by completion of a TLBI"
-	default y
-	select ARM64_WORKAROUND_REPEAT_TLBI
-	help
-	  This option adds a workaround for ARM Cortex-A55 erratum #2441007.
-
-	  Under very rare circumstances, affected Cortex-A55 CPUs
-	  may not handle a race between a break-before-make sequence on one
-	  CPU, and another CPU accessing the same page. This could allow a
-	  store to a page that has been unmapped.
-
-	  Work around this by adding the affected CPUs to the list that needs
-	  TLB sequences to be done twice.
-
-	  If unsure, say Y.
-
 config ARM64_ERRATUM_1286807
 	bool "Cortex-A76: Modification of the translation table for a virtual address might lead to read-after-read ordering violation"
 	default y
@@ -657,7 +639,6 @@ config ARM64_ERRATUM_1463225
 config ARM64_ERRATUM_1542419
 	bool "Neoverse-N1: workaround mis-ordering of instruction fetches"
 	default y
-	depends on BROKEN # CPU cap re-allocated by Android
 	help
 	  This option adds a workaround for ARM Neoverse-N1 erratum
 	  1542419.
@@ -802,23 +783,6 @@ config ARM64_ERRATUM_2224489
 
 	  If unsure, say Y.
 
-config ARM64_ERRATUM_2441009
-	bool "Cortex-A510: Completion of affected memory accesses might not be guaranteed by completion of a TLBI"
-	default y
-	select ARM64_WORKAROUND_REPEAT_TLBI
-	help
-	  This option adds a workaround for ARM Cortex-A510 erratum #2441009.
-
-	  Under very rare circumstances, affected Cortex-A510 CPUs
-	  may not handle a race between a break-before-make sequence on one
-	  CPU, and another CPU accessing the same page. This could allow a
-	  store to a page that has been unmapped.
-
-	  Work around this by adding the affected CPUs to the list that needs
-	  TLB sequences to be done twice.
-
-	  If unsure, say Y.
-
 config CAVIUM_ERRATUM_22375
 	bool "Cavium erratum 22375, 24313"
 	default y
@@ -858,7 +822,6 @@ config CAVIUM_ERRATUM_23154
 config CAVIUM_ERRATUM_27456
 	bool "Cavium erratum 27456: Broadcast TLBI instructions may cause icache corruption"
 	default y
-	depends on BROKEN # CPU cap re-allocated by Android
 	help
 	  On ThunderX T88 pass 1.x through 2.1 parts, broadcast TLBI
 	  instructions may cause the icache to become corrupted if it
@@ -870,7 +833,6 @@ config CAVIUM_ERRATUM_27456
 config CAVIUM_ERRATUM_30115
 	bool "Cavium erratum 30115: Guest may disable interrupts in host"
 	default y
-	depends on BROKEN # CPU cap re-allocated by Android
 	help
 	  On ThunderX T88 pass 1.x through 2.2, T81 pass 1.0 through
 	  1.2, and T83 Pass 1.0, KVM guest execution may disable
@@ -882,7 +844,6 @@ config CAVIUM_ERRATUM_30115
 config CAVIUM_TX2_ERRATUM_219
 	bool "Cavium ThunderX2 erratum 219: PRFM between TTBR change and ISB fails"
 	default y
-	depends on BROKEN # CPU caps re-allocated by Android
 	help
 	  On Cavium ThunderX2, a load, store or prefetch instruction between a
 	  TTBR update and the corresponding context synchronizing operation can
@@ -1780,8 +1741,6 @@ config ARM64_BTI_KERNEL
 	depends on CC_HAS_BRANCH_PROT_PAC_RET_BTI
 	# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=94697
 	depends on !CC_IS_GCC || GCC_VERSION >= 100100
-	# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106671
-	depends on !CC_IS_GCC
 	# https://github.com/llvm/llvm-project/commit/a88c722e687e6780dcd6a58718350dc76fcc4cc9
 	depends on !CC_IS_CLANG || CLANG_VERSION >= 120000
 	depends on (!FUNCTION_GRAPH_TRACER || DYNAMIC_FTRACE_WITH_REGS)
@@ -2091,6 +2050,89 @@ endmenu
 config SYSVIPC_COMPAT
 	def_bool y
 	depends on COMPAT && SYSVIPC
+
+menu "Hypervisor"
+config UH
+	bool "Enable micro hypervisor feature"
+	depends on !SEC_FACTORY
+	default y
+	help
+	  It enables a micro hypervisor.
+	  It's samsung's hypervisor.
+	  RKP and etc can be loaded on it.
+	  please check a memory map for it.
+	  
+config RKP
+	bool "Enable RKP(Realtime Kernel Protection) feature"
+	depends on UH
+	default y
+	help
+	  This solution provides the kernel protection
+	  using a security monitor located within an isolated execution environment.
+	  This isolated execution environment is either the Secure World of ARM TrustZone
+	  or a thin hypervisor that is protected by the hardware virtualization extensions.
+
+config RKP_FIMC_CHECK
+    bool "Enable fimc signing verification"
+    depends on RKP
+    default n
+    help
+      it verifies fimc signing.
+      
+config KDP
+	bool "Enable KDP(Kernel Data Protection) feature"
+	depends on !SEC_VTS_TEST
+	depends on UH
+	default y
+	help
+	  Prevents unauthorized cred modification,
+	  namespace modification, mapping for page table.
+
+config KDP_CRED
+	bool "Enable KDP(Kernel Data Protection) cred feature"
+	depends on !SEC_VTS_TEST
+	depends on UH
+	depends on KDP
+	default y
+	help
+	  Prevents unauthorized cred modification,
+	  namespace modification, mapping for page table.
+
+config KDP_NS
+	bool "Enable KDP(Kernel Data Protection) namespace feature"
+	depends on !SEC_VTS_TEST
+	depends on UH
+	depends on KDP
+	default y
+	help
+	  Prevents unauthorized cred modification,
+	  namespace modification, mapping for page table.
+	  
+config RKP_TEST
+	bool "Enable RKP test"
+	depends on !SAMSUNG_PRODUCT_SHIP && RKP
+	default y
+	help
+	  It is a test feature for RKP debugging.
+	  This configuration checks following lists.
+	  USER_PXN
+	  USER_PGTABLE_RO
+	  KERNEL_PGTABLE_RO
+	  KERNEL_L3PGT_RO
+	  KERNEL_RANGE_RWX
+	  
+config KDP_TEST
+	bool "Enable KDP test"
+	depends on !SAMSUNG_PRODUCT_SHIP && KDP_CRED && KDP_NS
+	default y
+	help
+	  It is a test configuration for KDP debugging.
+	  This configuration checks following lists.
+	  TASK_CRED_RO
+	  TASK_SECURITY_CONTEXT_RO
+	  CRED_MATCH_BACKPOINTERS
+	  SEC_CONTEXT_BACKPOINTER
+endmenu
 
 menu "Power management options"
 

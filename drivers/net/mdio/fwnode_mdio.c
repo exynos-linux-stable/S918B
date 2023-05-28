@@ -77,7 +77,6 @@ int fwnode_mdiobus_phy_device_register(struct mii_bus *mdio,
 	 */
 	rc = phy_device_register(phy);
 	if (rc) {
-		device_set_node(&phy->mdio.dev, NULL);
 		fwnode_handle_put(child);
 		return rc;
 	}
@@ -111,8 +110,8 @@ int fwnode_mdiobus_register_phy(struct mii_bus *bus,
 	else
 		phy = phy_device_create(bus, addr, phy_id, 0, NULL);
 	if (IS_ERR(phy)) {
-		rc = PTR_ERR(phy);
-		goto clean_mii_ts;
+		unregister_mii_timestamper(mii_ts);
+		return PTR_ERR(phy);
 	}
 
 	if (is_acpi_node(child)) {
@@ -121,19 +120,22 @@ int fwnode_mdiobus_register_phy(struct mii_bus *bus,
 		/* Associate the fwnode with the device structure so it
 		 * can be looked up later.
 		 */
-		phy->mdio.dev.fwnode = fwnode_handle_get(child);
+		phy->mdio.dev.fwnode = child;
 
 		/* All data is now stored in the phy struct, so register it */
 		rc = phy_device_register(phy);
 		if (rc) {
-			phy->mdio.dev.fwnode = NULL;
-			fwnode_handle_put(child);
-			goto clean_phy;
+			phy_device_free(phy);
+			fwnode_handle_put(phy->mdio.dev.fwnode);
+			return rc;
 		}
 	} else if (is_of_node(child)) {
 		rc = fwnode_mdiobus_phy_device_register(bus, phy, child, addr);
-		if (rc)
-			goto clean_phy;
+		if (rc) {
+			unregister_mii_timestamper(mii_ts);
+			phy_device_free(phy);
+			return rc;
+		}
 	}
 
 	/* phy->mii_ts may already be defined by the PHY driver. A
@@ -143,12 +145,5 @@ int fwnode_mdiobus_register_phy(struct mii_bus *bus,
 	if (mii_ts)
 		phy->mii_ts = mii_ts;
 	return 0;
-
-clean_phy:
-	phy_device_free(phy);
-clean_mii_ts:
-	unregister_mii_timestamper(mii_ts);
-
-	return rc;
 }
 EXPORT_SYMBOL(fwnode_mdiobus_register_phy);

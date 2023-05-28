@@ -3684,8 +3684,6 @@ static int ath11k_mac_set_txbf_conf(struct ath11k_vif *arvif)
 	if (vht_cap & (IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE)) {
 		nsts = vht_cap & IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK;
 		nsts >>= IEEE80211_VHT_CAP_BEAMFORMEE_STS_SHIFT;
-		if (nsts > (ar->num_rx_chains - 1))
-			nsts = ar->num_rx_chains - 1;
 		value |= SM(nsts, WMI_TXBF_STS_CAP_OFFSET);
 	}
 
@@ -3726,7 +3724,7 @@ static int ath11k_mac_set_txbf_conf(struct ath11k_vif *arvif)
 static void ath11k_set_vht_txbf_cap(struct ath11k *ar, u32 *vht_cap)
 {
 	bool subfer, subfee;
-	int sound_dim = 0, nsts = 0;
+	int sound_dim = 0;
 
 	subfer = !!(*vht_cap & (IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE));
 	subfee = !!(*vht_cap & (IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE));
@@ -3734,11 +3732,6 @@ static void ath11k_set_vht_txbf_cap(struct ath11k *ar, u32 *vht_cap)
 	if (ar->num_tx_chains < 2) {
 		*vht_cap &= ~(IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE);
 		subfer = false;
-	}
-
-	if (ar->num_rx_chains < 2) {
-		*vht_cap &= ~(IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE);
-		subfee = false;
 	}
 
 	/* If SU Beaformer is not set, then disable MU Beamformer Capability */
@@ -3753,9 +3746,7 @@ static void ath11k_set_vht_txbf_cap(struct ath11k *ar, u32 *vht_cap)
 	sound_dim >>= IEEE80211_VHT_CAP_SOUNDING_DIMENSIONS_SHIFT;
 	*vht_cap &= ~IEEE80211_VHT_CAP_SOUNDING_DIMENSIONS_MASK;
 
-	nsts = (*vht_cap & IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK);
-	nsts >>= IEEE80211_VHT_CAP_BEAMFORMEE_STS_SHIFT;
-	*vht_cap &= ~IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK;
+	/* TODO: Need to check invalid STS and Sound_dim values set by FW? */
 
 	/* Enable Sounding Dimension Field only if SU BF is enabled */
 	if (subfer) {
@@ -3767,15 +3758,9 @@ static void ath11k_set_vht_txbf_cap(struct ath11k *ar, u32 *vht_cap)
 		*vht_cap |= sound_dim;
 	}
 
-	/* Enable Beamformee STS Field only if SU BF is enabled */
-	if (subfee) {
-		if (nsts > (ar->num_rx_chains - 1))
-			nsts = ar->num_rx_chains - 1;
-
-		nsts <<= IEEE80211_VHT_CAP_BEAMFORMEE_STS_SHIFT;
-		nsts &=  IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK;
-		*vht_cap |= nsts;
-	}
+	/* Use the STS advertised by FW unless SU Beamformee is not supported*/
+	if (!subfee)
+		*vht_cap &= ~(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK);
 }
 
 static struct ieee80211_sta_vht_cap
@@ -4281,8 +4266,8 @@ static void ath11k_mgmt_over_wmi_tx_work(struct work_struct *work)
 		}
 
 		arvif = ath11k_vif_to_arvif(skb_cb->vif);
-		mutex_lock(&ar->conf_mutex);
-		if (ar->allocated_vdev_map & (1LL << arvif->vdev_id)) {
+		if (ar->allocated_vdev_map & (1LL << arvif->vdev_id) &&
+		    arvif->is_started) {
 			ret = ath11k_mac_mgmt_tx_wmi(ar, arvif, skb);
 			if (ret) {
 				ath11k_warn(ar->ab, "failed to tx mgmt frame, vdev_id %d :%d\n",
@@ -4298,7 +4283,6 @@ static void ath11k_mgmt_over_wmi_tx_work(struct work_struct *work)
 				    arvif->is_started);
 			ieee80211_free_txskb(ar->hw, skb);
 		}
-		mutex_unlock(&ar->conf_mutex);
 	}
 }
 
@@ -5608,7 +5592,6 @@ ath11k_mac_op_unassign_vif_chanctx(struct ieee80211_hw *hw,
 	struct ath11k *ar = hw->priv;
 	struct ath11k_base *ab = ar->ab;
 	struct ath11k_vif *arvif = (void *)vif->drv_priv;
-	struct ath11k_peer *peer;
 	int ret;
 
 	mutex_lock(&ar->conf_mutex);
@@ -5620,13 +5603,9 @@ ath11k_mac_op_unassign_vif_chanctx(struct ieee80211_hw *hw,
 	WARN_ON(!arvif->is_started);
 
 	if (ab->hw_params.vdev_start_delay &&
-	    arvif->vdev_type == WMI_VDEV_TYPE_MONITOR) {
-		spin_lock_bh(&ab->base_lock);
-		peer = ath11k_peer_find_by_addr(ab, ar->mac_addr);
-		spin_unlock_bh(&ab->base_lock);
-		if (peer)
-			ath11k_peer_delete(ar, arvif->vdev_id, ar->mac_addr);
-	}
+	    arvif->vdev_type == WMI_VDEV_TYPE_MONITOR &&
+	    ath11k_peer_find_by_addr(ab, ar->mac_addr))
+		ath11k_peer_delete(ar, arvif->vdev_id, ar->mac_addr);
 
 	ret = ath11k_mac_vdev_stop(arvif);
 	if (ret)

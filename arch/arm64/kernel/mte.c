@@ -56,12 +56,7 @@ static void mte_sync_page_tags(struct page *page, pte_t old_pte,
 	 * the new page->flags are visible before the tags were updated.
 	 */
 	smp_wmb();
-	/*
-	 * Test PG_mte_tagged again in case it was racing with another
-	 * set_pte_at().
-	 */
-	if (!test_and_set_bit(PG_mte_tagged, &page->flags))
-		mte_clear_page_tags(page_address(page));
+	mte_clear_page_tags(page_address(page));
 }
 
 void mte_sync_tags(pte_t old_pte, pte_t pte)
@@ -77,13 +72,10 @@ void mte_sync_tags(pte_t old_pte, pte_t pte)
 
 	/* if PG_mte_tagged is set, tags have already been initialised */
 	for (i = 0; i < nr_pages; i++, page++) {
-		if (!test_bit(PG_mte_tagged, &page->flags))
+		if (!test_and_set_bit(PG_mte_tagged, &page->flags))
 			mte_sync_page_tags(page, old_pte, check_swap,
 					   pte_is_tagged);
 	}
-
-	/* ensure the tags are visible before the PTE is set */
-	smp_wmb();
 }
 
 int memcmp_pages(struct page *page1, struct page *page2)

@@ -54,6 +54,17 @@ config SECURITY_NETWORK
 	  implement socket and networking access controls.
 	  If you are unsure how to answer this question, answer N.
 
+config PAGE_TABLE_ISOLATION
+	bool "Remove the kernel mapping in user mode"
+	default y
+	depends on (X86_64 || X86_PAE) && !UML
+	help
+	  This feature reduces the number of hardware side channels by
+	  ensuring that the majority of kernel addresses are not mapped
+	  into userspace.
+
+	  See Documentation/x86/pti.rst for more details.
+
 config SECURITY_INFINIBAND
 	bool "Infiniband Security Hooks"
 	depends on SECURITY && INFINIBAND
@@ -231,8 +242,14 @@ source "security/yama/Kconfig"
 source "security/safesetid/Kconfig"
 source "security/lockdown/Kconfig"
 source "security/landlock/Kconfig"
+source "security/samsung/defex_lsm/Kconfig"
 
 source "security/integrity/Kconfig"
+source "security/samsung/dsms/Kconfig"
+source "security/samsung/five/Kconfig"
+source "security/samsung/proca/Kconfig"
+source "security/samsung/proca/gaf/Kconfig"
+source "security/samsung/mz/Kconfig"
 
 choice
 	prompt "First legacy 'major LSM' to be initialized"
@@ -281,6 +298,19 @@ config LSM
 	  controlled at boot with the "lsm=" parameter.
 
 	  If unsure, leave this as the default.
+
+config DDAR
+	bool "Enables dual encryption"
+	default n
+	help
+	Knox Dual-DAR (Data-At-Rest) protection
+
+config SDP_KEY_DUMP
+	bool "SDP KEY DUMP"
+	default n
+	help
+	For dumping sensitive keying material for CC Certification test.
+	Enabled only for eng and userdebug builds.
 
 source "security/Kconfig.hardening"
 

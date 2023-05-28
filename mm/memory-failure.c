@@ -57,7 +57,6 @@
 #include <linux/ratelimit.h>
 #include <linux/page-isolation.h>
 #include <linux/pagewalk.h>
-#include <linux/shmem_fs.h>
 #include "internal.h"
 #include "ras/ras_event.h"
 
@@ -491,7 +490,7 @@ static void collect_procs_anon(struct page *page, struct list_head *to_kill,
 	struct anon_vma *av;
 	pgoff_t pgoff;
 
-	av = page_lock_anon_vma_read(page, NULL);
+	av = page_lock_anon_vma_read(page);
 	if (av == NULL)	/* Not actually mapped anymore */
 		return;
 
@@ -701,9 +700,6 @@ static int kill_accessing_process(struct task_struct *p, unsigned long pfn,
 	};
 	priv.tk.tsk = p;
 
-	if (!p->mm)
-		return -EFAULT;
-
 	mmap_read_lock(p->mm);
 	ret = walk_page_range(p->mm, 0, TASK_SIZE, &hwp_walk_ops,
 			      (void *)&priv);
@@ -812,44 +808,12 @@ static int truncate_error_page(struct page *p, unsigned long pfn,
 	return ret;
 }
 
-struct page_state {
-	unsigned long mask;
-	unsigned long res;
-	enum mf_action_page_type type;
-
-	/* Callback ->action() has to unlock the relevant page inside it. */
-	int (*action)(struct page_state *ps, struct page *p);
-};
-
-/*
- * Return true if page is still referenced by others, otherwise return
- * false.
- *
- * The extra_pins is true when one extra refcount is expected.
- */
-static bool has_extra_refcount(struct page_state *ps, struct page *p,
-			       bool extra_pins)
-{
-	int count = page_count(p) - 1;
-
-	if (extra_pins)
-		count -= 1;
-
-	if (count > 0) {
-		pr_err("Memory failure: %#lx: %s still referenced by %d users\n",
-		       page_to_pfn(p), action_page_types[ps->type], count);
-		return true;
-	}
-
-	return false;
-}
-
 /*
  * Error hit kernel page.
  * Do nothing, try to be lucky and not touch this instead. For a few cases we
  * could be more sophisticated.
  */
-static int me_kernel(struct page_state *ps, struct page *p)
+static int me_kernel(struct page *p, unsigned long pfn)
 {
 	unlock_page(p);
 	return MF_IGNORED;
@@ -858,9 +822,9 @@ static int me_kernel(struct page_state *ps, struct page *p)
 /*
  * Page in unknown state. Do nothing.
  */
-static int me_unknown(struct page_state *ps, struct page *p)
+static int me_unknown(struct page *p, unsigned long pfn)
 {
-	pr_err("Memory failure: %#lx: Unknown page state\n", page_to_pfn(p));
+	pr_err("Memory failure: %#lx: Unknown page state\n", pfn);
 	unlock_page(p);
 	return MF_FAILED;
 }
@@ -868,11 +832,10 @@ static int me_unknown(struct page_state *ps, struct page *p)
 /*
  * Clean (or cleaned) page cache page.
  */
-static int me_pagecache_clean(struct page_state *ps, struct page *p)
+static int me_pagecache_clean(struct page *p, unsigned long pfn)
 {
 	int ret;
 	struct address_space *mapping;
-	bool extra_pins;
 
 	delete_from_lru_cache(p);
 
@@ -902,23 +865,13 @@ static int me_pagecache_clean(struct page_state *ps, struct page *p)
 	}
 
 	/*
-	 * The shmem page is kept in page cache instead of truncating
-	 * so is expected to have an extra refcount after error-handling.
-	 */
-	extra_pins = shmem_mapping(mapping);
-
-	/*
 	 * Truncation is a bit tricky. Enable it per file system for now.
 	 *
 	 * Open: to take i_rwsem or not for this? Right now we don't.
 	 */
-	ret = truncate_error_page(p, page_to_pfn(p), mapping);
-	if (has_extra_refcount(ps, p, extra_pins))
-		ret = MF_FAILED;
-
+	ret = truncate_error_page(p, pfn, mapping);
 out:
 	unlock_page(p);
-
 	return ret;
 }
 
@@ -927,7 +880,7 @@ out:
  * Issues: when the error hit a hole page the error is not properly
  * propagated.
  */
-static int me_pagecache_dirty(struct page_state *ps, struct page *p)
+static int me_pagecache_dirty(struct page *p, unsigned long pfn)
 {
 	struct address_space *mapping = page_mapping(p);
 
@@ -971,7 +924,7 @@ static int me_pagecache_dirty(struct page_state *ps, struct page *p)
 		mapping_set_error(mapping, -EIO);
 	}
 
-	return me_pagecache_clean(ps, p);
+	return me_pagecache_clean(p, pfn);
 }
 
 /*
@@ -993,10 +946,9 @@ static int me_pagecache_dirty(struct page_state *ps, struct page *p)
  * Clean swap cache pages can be directly isolated. A later page fault will
  * bring in the known good data from disk.
  */
-static int me_swapcache_dirty(struct page_state *ps, struct page *p)
+static int me_swapcache_dirty(struct page *p, unsigned long pfn)
 {
 	int ret;
-	bool extra_pins = false;
 
 	ClearPageDirty(p);
 	/* Trigger EIO in shmem: */
@@ -1004,17 +956,10 @@ static int me_swapcache_dirty(struct page_state *ps, struct page *p)
 
 	ret = delete_from_lru_cache(p) ? MF_FAILED : MF_DELAYED;
 	unlock_page(p);
-
-	if (ret == MF_DELAYED)
-		extra_pins = true;
-
-	if (has_extra_refcount(ps, p, extra_pins))
-		ret = MF_FAILED;
-
 	return ret;
 }
 
-static int me_swapcache_clean(struct page_state *ps, struct page *p)
+static int me_swapcache_clean(struct page *p, unsigned long pfn)
 {
 	int ret;
 
@@ -1022,10 +967,6 @@ static int me_swapcache_clean(struct page_state *ps, struct page *p)
 
 	ret = delete_from_lru_cache(p) ? MF_FAILED : MF_RECOVERED;
 	unlock_page(p);
-
-	if (has_extra_refcount(ps, p, false))
-		ret = MF_FAILED;
-
 	return ret;
 }
 
@@ -1035,21 +976,18 @@ static int me_swapcache_clean(struct page_state *ps, struct page *p)
  * - Error on hugepage is contained in hugepage unit (not in raw page unit.)
  *   To narrow down kill region to one page, we need to break up pmd.
  */
-static int me_huge_page(struct page_state *ps, struct page *p)
+static int me_huge_page(struct page *p, unsigned long pfn)
 {
 	int res;
 	struct page *hpage = compound_head(p);
 	struct address_space *mapping;
-	bool extra_pins = false;
 
 	if (!PageHuge(hpage))
 		return MF_DELAYED;
 
 	mapping = page_mapping(hpage);
 	if (mapping) {
-		res = truncate_error_page(hpage, page_to_pfn(p), mapping);
-		/* The page is kept in page cache. */
-		extra_pins = true;
+		res = truncate_error_page(hpage, pfn, mapping);
 		unlock_page(hpage);
 	} else {
 		res = MF_FAILED;
@@ -1066,9 +1004,6 @@ static int me_huge_page(struct page_state *ps, struct page *p)
 			res = MF_RECOVERED;
 		}
 	}
-
-	if (has_extra_refcount(ps, p, extra_pins))
-		res = MF_FAILED;
 
 	return res;
 }
@@ -1095,7 +1030,14 @@ static int me_huge_page(struct page_state *ps, struct page *p)
 #define slab		(1UL << PG_slab)
 #define reserved	(1UL << PG_reserved)
 
-static struct page_state error_states[] = {
+static struct page_state {
+	unsigned long mask;
+	unsigned long res;
+	enum mf_action_page_type type;
+
+	/* Callback ->action() has to unlock the relevant page inside it. */
+	int (*action)(struct page *p, unsigned long pfn);
+} error_states[] = {
 	{ reserved,	reserved,	MF_MSG_KERNEL,	me_kernel },
 	/*
 	 * free pages are specially detected outside this table:
@@ -1155,10 +1097,19 @@ static int page_action(struct page_state *ps, struct page *p,
 			unsigned long pfn)
 {
 	int result;
+	int count;
 
 	/* page p should be unlocked after returning from ps->action().  */
-	result = ps->action(ps, p);
+	result = ps->action(p, pfn);
 
+	count = page_count(p) - 1;
+	if (ps->action == me_swapcache_dirty && result == MF_DELAYED)
+		count--;
+	if (count > 0) {
+		pr_err("Memory failure: %#lx: %s still referenced by %d users\n",
+		       pfn, action_page_types[ps->type], count);
+		result = MF_FAILED;
+	}
 	action_result(pfn, ps->type, result);
 
 	/* Could do more checks here if page looks ok */
@@ -1451,11 +1402,14 @@ static int identify_page_state(unsigned long pfn, struct page *p,
 static int try_to_split_thp_page(struct page *page, const char *msg)
 {
 	lock_page(page);
-	if (unlikely(split_huge_page(page))) {
+	if (!PageAnon(page) || unlikely(split_huge_page(page))) {
 		unsigned long pfn = page_to_pfn(page);
 
 		unlock_page(page);
-		pr_info("%s: %#lx: thp split failed\n", msg, pfn);
+		if (!PageAnon(page))
+			pr_info("%s: %#lx: non anonymous thp\n", msg, pfn);
+		else
+			pr_info("%s: %#lx: thp split failed\n", msg, pfn);
 		put_page(page);
 		return -EBUSY;
 	}
@@ -1464,114 +1418,58 @@ static int try_to_split_thp_page(struct page *page, const char *msg)
 	return 0;
 }
 
-/*
- * Called from hugetlb code with hugetlb_lock held.
- *
- * Return values:
- *   0             - free hugepage
- *   1             - in-use hugepage
- *   2             - not a hugepage
- *   -EBUSY        - the hugepage is busy (try to retry)
- *   -EHWPOISON    - the hugepage is already hwpoisoned
- */
-int __get_huge_page_for_hwpoison(unsigned long pfn, int flags)
+static int memory_failure_hugetlb(unsigned long pfn, int flags)
 {
-	struct page *page = pfn_to_page(pfn);
-	struct page *head = compound_head(page);
-	int ret = 2;	/* fallback to normal page handling */
-	bool count_increased = false;
-
-	if (!PageHeadHuge(head))
-		goto out;
-
-	if (flags & MF_COUNT_INCREASED) {
-		ret = 1;
-		count_increased = true;
-	} else if (HPageFreed(head) || HPageMigratable(head)) {
-		ret = get_page_unless_zero(head);
-		if (ret)
-			count_increased = true;
-	} else {
-		ret = -EBUSY;
-		goto out;
-	}
+	struct page *p = pfn_to_page(pfn);
+	struct page *head = compound_head(p);
+	int res;
+	unsigned long page_flags;
 
 	if (TestSetPageHWPoison(head)) {
-		ret = -EHWPOISON;
-		goto out;
-	}
-
-	return ret;
-out:
-	if (count_increased)
-		put_page(head);
-	return ret;
-}
-
-#ifdef CONFIG_HUGETLB_PAGE
-/*
- * Taking refcount of hugetlb pages needs extra care about race conditions
- * with basic operations like hugepage allocation/free/demotion.
- * So some of prechecks for hwpoison (pinning, and testing/setting
- * PageHWPoison) should be done in single hugetlb_lock range.
- */
-static int try_memory_failure_hugetlb(unsigned long pfn, int flags, int *hugetlb)
-{
-	int res;
-	struct page *p = pfn_to_page(pfn);
-	struct page *head;
-	unsigned long page_flags;
-	bool retry = true;
-
-	*hugetlb = 1;
-retry:
-	res = get_huge_page_for_hwpoison(pfn, flags);
-	if (res == 2) { /* fallback to normal page handling */
-		*hugetlb = 0;
-		return 0;
-	} else if (res == -EHWPOISON) {
-		pr_err("Memory failure: %#lx: already hardware poisoned\n", pfn);
-		if (flags & MF_ACTION_REQUIRED) {
-			head = compound_head(p);
+		pr_err("Memory failure: %#lx: already hardware poisoned\n",
+		       pfn);
+		res = -EHWPOISON;
+		if (flags & MF_ACTION_REQUIRED)
 			res = kill_accessing_process(current, page_to_pfn(head), flags);
-		}
 		return res;
-	} else if (res == -EBUSY) {
-		if (retry) {
-			retry = false;
-			goto retry;
-		}
-		action_result(pfn, MF_MSG_UNKNOWN, MF_IGNORED);
-		return res;
-	}
-
-	head = compound_head(p);
-	lock_page(head);
-
-	if (hwpoison_filter(p)) {
-		ClearPageHWPoison(head);
-		res = -EOPNOTSUPP;
-		goto out;
 	}
 
 	num_poisoned_pages_inc();
 
-	/*
-	 * Handling free hugepage.  The possible race with hugepage allocation
-	 * or demotion can be prevented by PageHWPoison flag.
-	 */
-	if (res == 0) {
-		unlock_page(head);
-		res = MF_FAILED;
-		if (__page_handle_poison(p)) {
-			page_ref_inc(p);
-			res = MF_RECOVERED;
+	if (!(flags & MF_COUNT_INCREASED)) {
+		res = get_hwpoison_page(p, flags);
+		if (!res) {
+			lock_page(head);
+			if (hwpoison_filter(p)) {
+				if (TestClearPageHWPoison(head))
+					num_poisoned_pages_dec();
+				unlock_page(head);
+				return 0;
+			}
+			unlock_page(head);
+			res = MF_FAILED;
+			if (__page_handle_poison(p)) {
+				page_ref_inc(p);
+				res = MF_RECOVERED;
+			}
+			action_result(pfn, MF_MSG_FREE_HUGE, res);
+			return res == MF_RECOVERED ? 0 : -EBUSY;
+		} else if (res < 0) {
+			action_result(pfn, MF_MSG_UNKNOWN, MF_IGNORED);
+			return -EBUSY;
 		}
-		action_result(pfn, MF_MSG_FREE_HUGE, res);
-		return res == MF_RECOVERED ? 0 : -EBUSY;
 	}
 
+	lock_page(head);
 	page_flags = head->flags;
+
+	if (!PageHWPoison(head)) {
+		pr_err("Memory failure: %#lx: just unpoisoned\n", pfn);
+		num_poisoned_pages_dec();
+		unlock_page(head);
+		put_page(head);
+		return 0;
+	}
 
 	/*
 	 * TODO: hwpoison for pud-sized hugetlb doesn't work right now, so
@@ -1599,12 +1497,6 @@ out:
 	unlock_page(head);
 	return res;
 }
-#else
-static inline int try_memory_failure_hugetlb(unsigned long pfn, int flags, int *hugetlb)
-{
-	return 0;
-}
-#endif
 
 static int memory_failure_dev_pagemap(unsigned long pfn, int flags,
 		struct dev_pagemap *pgmap)
@@ -1641,7 +1533,7 @@ static int memory_failure_dev_pagemap(unsigned long pfn, int flags,
 		goto out;
 
 	if (hwpoison_filter(page)) {
-		rc = -EOPNOTSUPP;
+		rc = 0;
 		goto unlock;
 	}
 
@@ -1692,8 +1584,6 @@ out:
 	return rc;
 }
 
-static DEFINE_MUTEX(mf_mutex);
-
 /**
  * memory_failure - Handle memory failure of a page.
  * @pfn: Page Number of the corrupted page
@@ -1710,10 +1600,6 @@ static DEFINE_MUTEX(mf_mutex);
  *
  * Must run in process context (e.g. a work queue) with interrupts
  * enabled and no spinlocks hold.
- *
- * Return: 0 for successfully handled the memory error,
- *         -EOPNOTSUPP for memory_filter() filtered the error event,
- *         < 0(except -EOPNOTSUPP) on failure.
  */
 int memory_failure(unsigned long pfn, int flags)
 {
@@ -1724,7 +1610,7 @@ int memory_failure(unsigned long pfn, int flags)
 	int res = 0;
 	unsigned long page_flags;
 	bool retry = true;
-	int hugetlb = 0;
+	static DEFINE_MUTEX(mf_mutex);
 
 	if (!sysctl_memory_failure_recovery)
 		panic("Memory failure on page %lx", pfn);
@@ -1745,9 +1631,10 @@ int memory_failure(unsigned long pfn, int flags)
 	mutex_lock(&mf_mutex);
 
 try_again:
-	res = try_memory_failure_hugetlb(pfn, flags, &hugetlb);
-	if (hugetlb)
+	if (PageHuge(p)) {
+		res = memory_failure_hugetlb(pfn, flags);
 		goto unlock_mutex;
+	}
 
 	if (TestSetPageHWPoison(p)) {
 		pr_err("Memory failure: %#lx: already hardware poisoned\n",
@@ -1857,12 +1744,21 @@ try_again:
 	 */
 	page_flags = p->flags;
 
+	/*
+	 * unpoison always clear PG_hwpoison inside page lock
+	 */
+	if (!PageHWPoison(p)) {
+		pr_err("Memory failure: %#lx: just unpoisoned\n", pfn);
+		num_poisoned_pages_dec();
+		unlock_page(p);
+		put_page(p);
+		goto unlock_mutex;
+	}
 	if (hwpoison_filter(p)) {
 		if (TestClearPageHWPoison(p))
 			num_poisoned_pages_dec();
 		unlock_page(p);
 		put_page(p);
-		res = -EOPNOTSUPP;
 		goto unlock_mutex;
 	}
 
@@ -2038,7 +1934,6 @@ int unpoison_memory(unsigned long pfn)
 	struct page *page;
 	struct page *p;
 	int freeit = 0;
-	int ret = 0;
 	unsigned long flags = 0;
 	static DEFINE_RATELIMIT_STATE(unpoison_rs, DEFAULT_RATELIMIT_INTERVAL,
 					DEFAULT_RATELIMIT_BURST);
@@ -2049,30 +1944,39 @@ int unpoison_memory(unsigned long pfn)
 	p = pfn_to_page(pfn);
 	page = compound_head(p);
 
-	mutex_lock(&mf_mutex);
-
 	if (!PageHWPoison(p)) {
 		unpoison_pr_info("Unpoison: Page was already unpoisoned %#lx\n",
 				 pfn, &unpoison_rs);
-		goto unlock_mutex;
+		return 0;
 	}
 
 	if (page_count(page) > 1) {
 		unpoison_pr_info("Unpoison: Someone grabs the hwpoison page %#lx\n",
 				 pfn, &unpoison_rs);
-		goto unlock_mutex;
+		return 0;
 	}
 
 	if (page_mapped(page)) {
 		unpoison_pr_info("Unpoison: Someone maps the hwpoison page %#lx\n",
 				 pfn, &unpoison_rs);
-		goto unlock_mutex;
+		return 0;
 	}
 
 	if (page_mapping(page)) {
 		unpoison_pr_info("Unpoison: the hwpoison page has non-NULL mapping %#lx\n",
 				 pfn, &unpoison_rs);
-		goto unlock_mutex;
+		return 0;
+	}
+
+	/*
+	 * unpoison_memory() can encounter thp only when the thp is being
+	 * worked by memory_failure() and the page lock is not held yet.
+	 * In such case, we yield to memory_failure() and make unpoison fail.
+	 */
+	if (!PageHuge(page) && PageTransHuge(page)) {
+		unpoison_pr_info("Unpoison: Memory failure is now running on %#lx\n",
+				 pfn, &unpoison_rs);
+		return 0;
 	}
 
 	if (!get_hwpoison_page(p, flags)) {
@@ -2080,23 +1984,29 @@ int unpoison_memory(unsigned long pfn)
 			num_poisoned_pages_dec();
 		unpoison_pr_info("Unpoison: Software-unpoisoned free page %#lx\n",
 				 pfn, &unpoison_rs);
-		goto unlock_mutex;
+		return 0;
 	}
 
+	lock_page(page);
+	/*
+	 * This test is racy because PG_hwpoison is set outside of page lock.
+	 * That's acceptable because that won't trigger kernel panic. Instead,
+	 * the PG_hwpoison page will be caught and isolated on the entrance to
+	 * the free buddy page pool.
+	 */
 	if (TestClearPageHWPoison(page)) {
 		unpoison_pr_info("Unpoison: Software-unpoisoned page %#lx\n",
 				 pfn, &unpoison_rs);
 		num_poisoned_pages_dec();
 		freeit = 1;
 	}
+	unlock_page(page);
 
 	put_page(page);
 	if (freeit && !(pfn == my_zero_pfn(0) && page_count(p) == 1))
 		put_page(page);
 
-unlock_mutex:
-	mutex_unlock(&mf_mutex);
-	return ret;
+	return 0;
 }
 EXPORT_SYMBOL(unpoison_memory);
 
@@ -2106,7 +2016,7 @@ static bool isolate_page(struct page *page, struct list_head *pagelist)
 	bool lru = PageLRU(page);
 
 	if (PageHuge(page)) {
-		isolated = !isolate_hugetlb(page, pagelist);
+		isolated = isolate_huge_page(page, pagelist);
 	} else {
 		if (lru)
 			isolated = !isolate_lru_page(page);
@@ -2277,12 +2187,9 @@ int soft_offline_page(unsigned long pfn, int flags)
 		return -EIO;
 	}
 
-	mutex_lock(&mf_mutex);
-
 	if (PageHWPoison(page)) {
 		pr_info("%s: %#lx page already poisoned\n", __func__, pfn);
 		put_ref_page(ref_page);
-		mutex_unlock(&mf_mutex);
 		return 0;
 	}
 
@@ -2300,8 +2207,6 @@ retry:
 			goto retry;
 		}
 	}
-
-	mutex_unlock(&mf_mutex);
 
 	return ret;
 }

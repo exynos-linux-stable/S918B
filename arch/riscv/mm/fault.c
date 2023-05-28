@@ -31,7 +31,7 @@ static void die_kernel_fault(const char *msg, unsigned long addr,
 
 	bust_spinlocks(0);
 	die(regs, "Oops");
-	make_task_dead(SIGKILL);
+	do_exit(SIGKILL);
 }
 
 static inline void no_context(struct pt_regs *regs, unsigned long addr)
@@ -188,8 +188,7 @@ static inline bool access_error(unsigned long cause, struct vm_area_struct *vma)
 		}
 		break;
 	case EXC_LOAD_PAGE_FAULT:
-		/* Write implies read */
-		if (!(vma->vm_flags & (VM_READ | VM_WRITE))) {
+		if (!(vma->vm_flags & VM_READ)) {
 			return true;
 		}
 		break;

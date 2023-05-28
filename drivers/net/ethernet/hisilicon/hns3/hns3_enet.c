@@ -1005,7 +1005,9 @@ static bool hns3_can_use_tx_bounce(struct hns3_enet_ring *ring,
 		return false;
 
 	if (ALIGN(len, dma_get_cache_alignment()) > space) {
-		hns3_ring_stats_update(ring, tx_spare_full);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.tx_spare_full++;
+		u64_stats_update_end(&ring->syncp);
 		return false;
 	}
 
@@ -1022,7 +1024,9 @@ static bool hns3_can_use_tx_sgl(struct hns3_enet_ring *ring,
 		return false;
 
 	if (space < HNS3_MAX_SGL_SIZE) {
-		hns3_ring_stats_update(ring, tx_spare_full);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.tx_spare_full++;
+		u64_stats_update_end(&ring->syncp);
 		return false;
 	}
 
@@ -1550,7 +1554,9 @@ static int hns3_fill_skb_desc(struct hns3_enet_ring *ring,
 
 	ret = hns3_handle_vtags(ring, skb);
 	if (unlikely(ret < 0)) {
-		hns3_ring_stats_update(ring, tx_vlan_err);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.tx_vlan_err++;
+		u64_stats_update_end(&ring->syncp);
 		return ret;
 	} else if (ret == HNS3_INNER_VLAN_TAG) {
 		inner_vtag = skb_vlan_tag_get(skb);
@@ -1585,7 +1591,9 @@ static int hns3_fill_skb_desc(struct hns3_enet_ring *ring,
 
 		ret = hns3_get_l4_protocol(skb, &ol4_proto, &il4_proto);
 		if (unlikely(ret < 0)) {
-			hns3_ring_stats_update(ring, tx_l4_proto_err);
+			u64_stats_update_begin(&ring->syncp);
+			ring->stats.tx_l4_proto_err++;
+			u64_stats_update_end(&ring->syncp);
 			return ret;
 		}
 
@@ -1593,14 +1601,18 @@ static int hns3_fill_skb_desc(struct hns3_enet_ring *ring,
 				      &type_cs_vlan_tso,
 				      &ol_type_vlan_len_msec);
 		if (unlikely(ret < 0)) {
-			hns3_ring_stats_update(ring, tx_l2l3l4_err);
+			u64_stats_update_begin(&ring->syncp);
+			ring->stats.tx_l2l3l4_err++;
+			u64_stats_update_end(&ring->syncp);
 			return ret;
 		}
 
 		ret = hns3_set_tso(skb, &paylen_ol4cs, &mss_hw_csum,
 				   &type_cs_vlan_tso, &desc_cb->send_bytes);
 		if (unlikely(ret < 0)) {
-			hns3_ring_stats_update(ring, tx_tso_err);
+			u64_stats_update_begin(&ring->syncp);
+			ring->stats.tx_tso_err++;
+			u64_stats_update_end(&ring->syncp);
 			return ret;
 		}
 	}
@@ -1693,7 +1705,9 @@ static int hns3_map_and_fill_desc(struct hns3_enet_ring *ring, void *priv,
 	}
 
 	if (unlikely(dma_mapping_error(dev, dma))) {
-		hns3_ring_stats_update(ring, sw_err_cnt);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.sw_err_cnt++;
+		u64_stats_update_end(&ring->syncp);
 		return -ENOMEM;
 	}
 
@@ -1839,7 +1853,9 @@ static int hns3_skb_linearize(struct hns3_enet_ring *ring,
 	 * recursion level of over HNS3_MAX_RECURSION_LEVEL.
 	 */
 	if (bd_num == UINT_MAX) {
-		hns3_ring_stats_update(ring, over_max_recursion);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.over_max_recursion++;
+		u64_stats_update_end(&ring->syncp);
 		return -ENOMEM;
 	}
 
@@ -1848,12 +1864,16 @@ static int hns3_skb_linearize(struct hns3_enet_ring *ring,
 	 */
 	if (skb->len > HNS3_MAX_TSO_SIZE ||
 	    (!skb_is_gso(skb) && skb->len > HNS3_MAX_NON_TSO_SIZE)) {
-		hns3_ring_stats_update(ring, hw_limitation);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.hw_limitation++;
+		u64_stats_update_end(&ring->syncp);
 		return -ENOMEM;
 	}
 
 	if (__skb_linearize(skb)) {
-		hns3_ring_stats_update(ring, sw_err_cnt);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.sw_err_cnt++;
+		u64_stats_update_end(&ring->syncp);
 		return -ENOMEM;
 	}
 
@@ -1883,7 +1903,9 @@ static int hns3_nic_maybe_stop_tx(struct hns3_enet_ring *ring,
 
 		bd_num = hns3_tx_bd_count(skb->len);
 
-		hns3_ring_stats_update(ring, tx_copy);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.tx_copy++;
+		u64_stats_update_end(&ring->syncp);
 	}
 
 out:
@@ -1903,7 +1925,9 @@ out:
 		return bd_num;
 	}
 
-	hns3_ring_stats_update(ring, tx_busy);
+	u64_stats_update_begin(&ring->syncp);
+	ring->stats.tx_busy++;
+	u64_stats_update_end(&ring->syncp);
 
 	return -EBUSY;
 }
@@ -1988,7 +2012,9 @@ static void hns3_tx_doorbell(struct hns3_enet_ring *ring, int num,
 	ring->pending_buf += num;
 
 	if (!doorbell) {
-		hns3_ring_stats_update(ring, tx_more);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.tx_more++;
+		u64_stats_update_end(&ring->syncp);
 		return;
 	}
 
@@ -2038,7 +2064,9 @@ static int hns3_handle_tx_bounce(struct hns3_enet_ring *ring,
 	ret = skb_copy_bits(skb, 0, buf, size);
 	if (unlikely(ret < 0)) {
 		hns3_tx_spare_rollback(ring, cb_len);
-		hns3_ring_stats_update(ring, copy_bits_err);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.copy_bits_err++;
+		u64_stats_update_end(&ring->syncp);
 		return ret;
 	}
 
@@ -2061,8 +2089,9 @@ static int hns3_handle_tx_bounce(struct hns3_enet_ring *ring,
 	dma_sync_single_for_device(ring_to_dev(ring), dma, size,
 				   DMA_TO_DEVICE);
 
-	hns3_ring_stats_update(ring, tx_bounce);
-
+	u64_stats_update_begin(&ring->syncp);
+	ring->stats.tx_bounce++;
+	u64_stats_update_end(&ring->syncp);
 	return bd_num;
 }
 
@@ -2092,7 +2121,9 @@ static int hns3_handle_tx_sgl(struct hns3_enet_ring *ring,
 	nents = skb_to_sgvec(skb, sgt->sgl, 0, skb->len);
 	if (unlikely(nents < 0)) {
 		hns3_tx_spare_rollback(ring, cb_len);
-		hns3_ring_stats_update(ring, skb2sgl_err);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.skb2sgl_err++;
+		u64_stats_update_end(&ring->syncp);
 		return -ENOMEM;
 	}
 
@@ -2101,7 +2132,9 @@ static int hns3_handle_tx_sgl(struct hns3_enet_ring *ring,
 				DMA_TO_DEVICE);
 	if (unlikely(!sgt->nents)) {
 		hns3_tx_spare_rollback(ring, cb_len);
-		hns3_ring_stats_update(ring, map_sg_err);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.map_sg_err++;
+		u64_stats_update_end(&ring->syncp);
 		return -ENOMEM;
 	}
 
@@ -2113,7 +2146,10 @@ static int hns3_handle_tx_sgl(struct hns3_enet_ring *ring,
 	for (i = 0; i < sgt->nents; i++)
 		bd_num += hns3_fill_desc(ring, sg_dma_address(sgt->sgl + i),
 					 sg_dma_len(sgt->sgl + i));
-	hns3_ring_stats_update(ring, tx_sgl);
+
+	u64_stats_update_begin(&ring->syncp);
+	ring->stats.tx_sgl++;
+	u64_stats_update_end(&ring->syncp);
 
 	return bd_num;
 }
@@ -2152,7 +2188,9 @@ netdev_tx_t hns3_nic_net_xmit(struct sk_buff *skb, struct net_device *netdev)
 	if (skb_put_padto(skb, HNS3_MIN_TX_LEN)) {
 		hns3_tx_doorbell(ring, 0, !netdev_xmit_more());
 
-		hns3_ring_stats_update(ring, sw_err_cnt);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.sw_err_cnt++;
+		u64_stats_update_end(&ring->syncp);
 
 		return NETDEV_TX_OK;
 	}
@@ -3484,13 +3522,17 @@ static bool hns3_nic_alloc_rx_buffers(struct hns3_enet_ring *ring,
 	for (i = 0; i < cleand_count; i++) {
 		desc_cb = &ring->desc_cb[ring->next_to_use];
 		if (desc_cb->reuse_flag) {
-			hns3_ring_stats_update(ring, reuse_pg_cnt);
+			u64_stats_update_begin(&ring->syncp);
+			ring->stats.reuse_pg_cnt++;
+			u64_stats_update_end(&ring->syncp);
 
 			hns3_reuse_buffer(ring, ring->next_to_use);
 		} else {
 			ret = hns3_alloc_and_map_buffer(ring, &res_cbs);
 			if (ret) {
-				hns3_ring_stats_update(ring, sw_err_cnt);
+				u64_stats_update_begin(&ring->syncp);
+				ring->stats.sw_err_cnt++;
+				u64_stats_update_end(&ring->syncp);
 
 				hns3_rl_err(ring_to_netdev(ring),
 					    "alloc rx buffer failed: %d\n",
@@ -3502,7 +3544,9 @@ static bool hns3_nic_alloc_rx_buffers(struct hns3_enet_ring *ring,
 			}
 			hns3_replace_buffer(ring, ring->next_to_use, &res_cbs);
 
-			hns3_ring_stats_update(ring, non_reuse_pg);
+			u64_stats_update_begin(&ring->syncp);
+			ring->stats.non_reuse_pg++;
+			u64_stats_update_end(&ring->syncp);
 		}
 
 		ring_ptr_move_fw(ring, next_to_use);
@@ -3517,34 +3561,6 @@ static bool hns3_can_reuse_page(struct hns3_desc_cb *cb)
 	return page_count(cb->priv) == cb->pagecnt_bias;
 }
 
-static int hns3_handle_rx_copybreak(struct sk_buff *skb, int i,
-				    struct hns3_enet_ring *ring,
-				    int pull_len,
-				    struct hns3_desc_cb *desc_cb)
-{
-	struct hns3_desc *desc = &ring->desc[ring->next_to_clean];
-	u32 frag_offset = desc_cb->page_offset + pull_len;
-	int size = le16_to_cpu(desc->rx.size);
-	u32 frag_size = size - pull_len;
-	void *frag = napi_alloc_frag(frag_size);
-
-	if (unlikely(!frag)) {
-		hns3_ring_stats_update(ring, frag_alloc_err);
-
-		hns3_rl_err(ring_to_netdev(ring),
-			    "failed to allocate rx frag\n");
-		return -ENOMEM;
-	}
-
-	desc_cb->reuse_flag = 1;
-	memcpy(frag, desc_cb->buf + frag_offset, frag_size);
-	skb_add_rx_frag(skb, i, virt_to_page(frag),
-			offset_in_page(frag), frag_size, frag_size);
-
-	hns3_ring_stats_update(ring, frag_alloc);
-	return 0;
-}
-
 static void hns3_nic_reuse_page(struct sk_buff *skb, int i,
 				struct hns3_enet_ring *ring, int pull_len,
 				struct hns3_desc_cb *desc_cb)
@@ -3554,7 +3570,6 @@ static void hns3_nic_reuse_page(struct sk_buff *skb, int i,
 	int size = le16_to_cpu(desc->rx.size);
 	u32 truesize = hns3_buf_size(ring);
 	u32 frag_size = size - pull_len;
-	int ret = 0;
 	bool reused;
 
 	if (ring->page_pool) {
@@ -3589,9 +3604,27 @@ static void hns3_nic_reuse_page(struct sk_buff *skb, int i,
 		desc_cb->page_offset = 0;
 		desc_cb->reuse_flag = 1;
 	} else if (frag_size <= ring->rx_copybreak) {
-		ret = hns3_handle_rx_copybreak(skb, i, ring, pull_len, desc_cb);
-		if (!ret)
-			return;
+		void *frag = napi_alloc_frag(frag_size);
+
+		if (unlikely(!frag)) {
+			u64_stats_update_begin(&ring->syncp);
+			ring->stats.frag_alloc_err++;
+			u64_stats_update_end(&ring->syncp);
+
+			hns3_rl_err(ring_to_netdev(ring),
+				    "failed to allocate rx frag\n");
+			goto out;
+		}
+
+		desc_cb->reuse_flag = 1;
+		memcpy(frag, desc_cb->buf + frag_offset, frag_size);
+		skb_add_rx_frag(skb, i, virt_to_page(frag),
+				offset_in_page(frag), frag_size, frag_size);
+
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.frag_alloc++;
+		u64_stats_update_end(&ring->syncp);
+		return;
 	}
 
 out:
@@ -3667,16 +3700,20 @@ static int hns3_gro_complete(struct sk_buff *skb, u32 l234info)
 	return 0;
 }
 
-static void hns3_checksum_complete(struct hns3_enet_ring *ring,
+static bool hns3_checksum_complete(struct hns3_enet_ring *ring,
 				   struct sk_buff *skb, u32 ptype, u16 csum)
 {
 	if (ptype == HNS3_INVALID_PTYPE ||
 	    hns3_rx_ptype_tbl[ptype].ip_summed != CHECKSUM_COMPLETE)
-		return;
+		return false;
 
-	hns3_ring_stats_update(ring, csum_complete);
+	u64_stats_update_begin(&ring->syncp);
+	ring->stats.csum_complete++;
+	u64_stats_update_end(&ring->syncp);
 	skb->ip_summed = CHECKSUM_COMPLETE;
 	skb->csum = csum_unfold((__force __sum16)csum);
+
+	return true;
 }
 
 static void hns3_rx_handle_csum(struct sk_buff *skb, u32 l234info,
@@ -3736,7 +3773,8 @@ static void hns3_rx_checksum(struct hns3_enet_ring *ring, struct sk_buff *skb,
 		ptype = hnae3_get_field(ol_info, HNS3_RXD_PTYPE_M,
 					HNS3_RXD_PTYPE_S);
 
-	hns3_checksum_complete(ring, skb, ptype, csum);
+	if (hns3_checksum_complete(ring, skb, ptype, csum))
+		return;
 
 	/* check if hardware has done checksum */
 	if (!(bd_base_info & BIT(HNS3_RXD_L3L4P_B)))
@@ -3745,8 +3783,9 @@ static void hns3_rx_checksum(struct hns3_enet_ring *ring, struct sk_buff *skb,
 	if (unlikely(l234info & (BIT(HNS3_RXD_L3E_B) | BIT(HNS3_RXD_L4E_B) |
 				 BIT(HNS3_RXD_OL3E_B) |
 				 BIT(HNS3_RXD_OL4E_B)))) {
-		skb->ip_summed = CHECKSUM_NONE;
-		hns3_ring_stats_update(ring, l3l4_csum_err);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.l3l4_csum_err++;
+		u64_stats_update_end(&ring->syncp);
 
 		return;
 	}
@@ -3837,7 +3876,10 @@ static int hns3_alloc_skb(struct hns3_enet_ring *ring, unsigned int length,
 	skb = ring->skb;
 	if (unlikely(!skb)) {
 		hns3_rl_err(netdev, "alloc rx skb fail\n");
-		hns3_ring_stats_update(ring, sw_err_cnt);
+
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.sw_err_cnt++;
+		u64_stats_update_end(&ring->syncp);
 
 		return -ENOMEM;
 	}
@@ -3868,7 +3910,9 @@ static int hns3_alloc_skb(struct hns3_enet_ring *ring, unsigned int length,
 	if (ring->page_pool)
 		skb_mark_for_recycle(skb);
 
-	hns3_ring_stats_update(ring, seg_pkt_cnt);
+	u64_stats_update_begin(&ring->syncp);
+	ring->stats.seg_pkt_cnt++;
+	u64_stats_update_end(&ring->syncp);
 
 	ring->pull_len = eth_get_headlen(netdev, va, HNS3_RX_HEAD_SIZE);
 	__skb_put(skb, ring->pull_len);
@@ -4060,7 +4104,9 @@ static int hns3_handle_bdinfo(struct hns3_enet_ring *ring, struct sk_buff *skb)
 	ret = hns3_set_gro_and_checksum(ring, skb, l234info,
 					bd_base_info, ol_info, csum);
 	if (unlikely(ret)) {
-		hns3_ring_stats_update(ring, rx_err_cnt);
+		u64_stats_update_begin(&ring->syncp);
+		ring->stats.rx_err_cnt++;
+		u64_stats_update_end(&ring->syncp);
 		return ret;
 	}
 
@@ -5272,7 +5318,9 @@ static int hns3_clear_rx_ring(struct hns3_enet_ring *ring)
 		if (!ring->desc_cb[ring->next_to_use].reuse_flag) {
 			ret = hns3_alloc_and_map_buffer(ring, &res_cbs);
 			if (ret) {
-				hns3_ring_stats_update(ring, sw_err_cnt);
+				u64_stats_update_begin(&ring->syncp);
+				ring->stats.sw_err_cnt++;
+				u64_stats_update_end(&ring->syncp);
 				/* if alloc new buffer fail, exit directly
 				 * and reclear in up flow.
 				 */

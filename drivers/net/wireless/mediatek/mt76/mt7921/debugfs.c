@@ -262,44 +262,31 @@ mt7921_txpwr(struct seq_file *s, void *data)
 	return 0;
 }
 
-static void
-mt7921_pm_interface_iter(void *priv, u8 *mac, struct ieee80211_vif *vif)
-{
-	struct mt7921_dev *dev = priv;
-
-	mt7921_mcu_set_beacon_filter(dev, vif, dev->pm.enable);
-}
-
 static int
 mt7921_pm_set(void *data, u64 val)
 {
 	struct mt7921_dev *dev = data;
 	struct mt76_connac_pm *pm = &dev->pm;
-
-	mutex_lock(&dev->mt76.mutex);
+	struct mt76_phy *mphy = dev->phy.mt76;
 
 	if (val == pm->enable)
-		goto out;
+		return 0;
+
+	mt7921_mutex_acquire(dev);
 
 	if (!pm->enable) {
 		pm->stats.last_wake_event = jiffies;
 		pm->stats.last_doze_event = jiffies;
 	}
-	/* make sure the chip is awake here and ps_work is scheduled
-	 * just at end of the this routine.
-	 */
-	pm->enable = false;
-	mt76_connac_pm_wake(&dev->mphy, pm);
-
 	pm->enable = val;
-	ieee80211_iterate_active_interfaces(mt76_hw(dev),
+
+	ieee80211_iterate_active_interfaces(mphy->hw,
 					    IEEE80211_IFACE_ITER_RESUME_ALL,
-					    mt7921_pm_interface_iter, dev);
+					    mt7921_pm_interface_iter, mphy->priv);
 
 	mt76_connac_mcu_set_deep_sleep(&dev->mt76, pm->ds_enable);
-	mt76_connac_power_save_sched(&dev->mphy, pm);
-out:
-	mutex_unlock(&dev->mt76.mutex);
+
+	mt7921_mutex_release(dev);
 
 	return 0;
 }

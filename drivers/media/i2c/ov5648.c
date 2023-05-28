@@ -2498,9 +2498,9 @@ static int ov5648_probe(struct i2c_client *client)
 
 	/* DOVDD: digital I/O */
 	sensor->dovdd = devm_regulator_get(dev, "dovdd");
-	if (IS_ERR(sensor->dovdd)) {
+	if (IS_ERR(sensor->dvdd)) {
 		dev_err(dev, "cannot get DOVDD (digital I/O) regulator\n");
-		ret = PTR_ERR(sensor->dovdd);
+		ret = PTR_ERR(sensor->dvdd);
 		goto error_endpoint;
 	}
 

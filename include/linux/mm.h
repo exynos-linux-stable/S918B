@@ -679,15 +679,6 @@ struct vm_operations_struct {
 	ANDROID_KABI_RESERVE(4);
 };
 
-static inline void INIT_VMA(struct vm_area_struct *vma)
-{
-#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
-	/* Start from 0 to use atomic_inc_unless_negative() in get_vma() */
-	atomic_set(&vma->file_ref_count, 0);
-#endif
-	INIT_LIST_HEAD(&vma->anon_vma_chain);
-}
-
 static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
 {
 	static const struct vm_operations_struct dummy_vm_ops = {};
@@ -695,7 +686,11 @@ static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
 	memset(vma, 0, sizeof(*vma));
 	vma->vm_mm = mm;
 	vma->vm_ops = &dummy_vm_ops;
-	INIT_VMA(vma);
+#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
+        /* Start from 0 to use atomic_inc_unless_negative() in get_vma() */
+	atomic_set(&vma->file_ref_count, 0);
+#endif
+	INIT_LIST_HEAD(&vma->anon_vma_chain);
 }
 
 static inline void vma_set_anonymous(struct vm_area_struct *vma)
@@ -1618,13 +1613,8 @@ static inline unsigned long page_to_section(const struct page *page)
 #ifdef CONFIG_MIGRATION
 static inline bool is_pinnable_page(struct page *page)
 {
-#ifdef CONFIG_CMA
-	int mt = get_pageblock_migratetype(page);
-
-	if (mt == MIGRATE_CMA || mt == MIGRATE_ISOLATE)
-		return false;
-#endif
-	return !is_zone_movable_page(page) || is_zero_pfn(page_to_pfn(page));
+	return !(is_zone_movable_page(page) || is_migrate_cma_page(page)) ||
+		is_zero_pfn(page_to_pfn(page));
 }
 #else
 static inline bool is_pinnable_page(struct page *page)
@@ -2667,7 +2657,6 @@ extern int install_special_mapping(struct mm_struct *mm,
 				   unsigned long flags, struct page **pages);
 
 unsigned long randomize_stack_top(unsigned long stack_top);
-unsigned long randomize_page(unsigned long start, unsigned long range);
 
 extern unsigned long get_unmapped_area(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
 
@@ -2730,6 +2719,8 @@ extern vm_fault_t filemap_page_mkwrite(struct vm_fault *vmf);
 /* mm/page-writeback.c */
 int __must_check write_one_page(struct page *page);
 void task_dirty_inc(struct task_struct *tsk);
+
+extern unsigned int mmap_readaround_limit;
 
 extern unsigned long stack_guard_gap;
 /* Generic expand stack which grows the stack according to GROWS{UP,DOWN} */
@@ -3201,14 +3192,6 @@ extern int sysctl_memory_failure_recovery;
 extern void shake_page(struct page *p);
 extern atomic_long_t num_poisoned_pages __read_mostly;
 extern int soft_offline_page(unsigned long pfn, int flags);
-#ifdef CONFIG_MEMORY_FAILURE
-extern int __get_huge_page_for_hwpoison(unsigned long pfn, int flags);
-#else
-static inline int __get_huge_page_for_hwpoison(unsigned long pfn, int flags)
-{
-	return 0;
-}
-#endif
 
 
 /*
@@ -3310,6 +3293,45 @@ void __init setup_nr_node_ids(void);
 #else
 static inline void setup_nr_node_ids(void) {}
 #endif
+
+struct seq_file;
+void seq_printf(struct seq_file *m, const char *f, ...);
+
+static inline void show_val_meminfo(struct seq_file *m,
+				    const char *str, long size)
+{
+	char name[17];
+	int len = strlen(str);
+
+	if (len <= 15) {
+		sprintf(name, "%s:", str);
+	} else {
+		strncpy(name, str, 15);
+		name[15] = ':';
+		name[16] = '\0';
+	}
+
+	seq_printf(m, "%-16s%8ld kB\n", name, size);
+}
+
+extern bool am_app_launch;
+
+#ifdef CONFIG_RBIN
+#define WAKE_RBIN_PRERECLAIM 1
+#define GET_RBIN_STATS 2
+
+enum rbin_stat_item {
+	RBIN_ALLOCATED,
+	RBIN_CACHED,
+	RBIN_FREE,
+	RBIN_POOL,
+	NR_RBIN_STAT_ITEMS
+};
+extern int rbin_oem_func(int cmd, int *stats);
+extern unsigned long rbin_total;
+#endif
+
+extern inline bool need_memory_boosting(void);
 
 extern int memcmp_pages(struct page *page1, struct page *page2);
 
@@ -3421,6 +3443,74 @@ void put_vma(struct vm_area_struct *vma);
 
 #endif	/* CONFIG_SPECULATIVE_PAGE_FAULT */
 #endif	/* CONFIG_MMU */
+
+extern unsigned long physpages, codesize, datasize, rosize, bss_size;
+extern unsigned long init_code_size, init_data_size;
+
+#define GPU_PAGE_MAGIC (0x9A0E06B9A0E)
+
+static inline bool is_gpu_page(struct page *page)
+{
+	return (page->mapping
+		&& !((unsigned long)page->mapping & PAGE_MAPPING_ANON)
+		&& (page->mapping->private_data == (void *)GPU_PAGE_MAGIC));
+}
+
+static inline bool is_gpu_mapping(struct address_space *mapping)
+{
+	return (mapping && !((unsigned long)mapping & PAGE_MAPPING_ANON)
+			&& (mapping->private_data == (void *)GPU_PAGE_MAGIC));
+}
+
+extern atomic_long_t _total_kgsl_shmem_pages;
+static inline unsigned long get_total_kgsl_shmem_pages(void)
+{
+	long x = atomic_long_read(&_total_kgsl_shmem_pages);
+
+	if (x < 0)
+		x = 0;
+	return x;
+}
+
+static inline void total_kgsl_shmem_pages_add(long count)
+{
+	atomic_long_add(count, &_total_kgsl_shmem_pages);
+}
+
+static inline void total_kgsl_shmem_pages_dec(void)
+{
+	atomic_long_dec(&_total_kgsl_shmem_pages);
+}
+
+static inline void total_kgsl_shmem_pages_sub(long count)
+{
+	atomic_long_sub(count, &_total_kgsl_shmem_pages);
+}
+
+extern atomic_long_t _total_kgsl_reclaimed_pages;
+static inline unsigned long get_total_kgsl_reclaimed_pages(void)
+{
+	long x = atomic_long_read(&_total_kgsl_reclaimed_pages);
+
+	if (x < 0)
+		x = 0;
+	return x;
+}
+
+static inline void total_kgsl_reclaimed_pages_inc(void)
+{
+	atomic_long_inc(&_total_kgsl_reclaimed_pages);
+}
+
+static inline void total_kgsl_reclaimed_pages_dec(void)
+{
+	atomic_long_dec(&_total_kgsl_reclaimed_pages);
+}
+
+static inline void total_kgsl_reclaimed_pages_sub(long count)
+{
+	atomic_long_sub(count, &_total_kgsl_reclaimed_pages);
+}
 
 #endif /* __KERNEL__ */
 #endif /* _LINUX_MM_H */

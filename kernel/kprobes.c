@@ -1559,9 +1559,7 @@ static int check_kprobe_address_safe(struct kprobe *p,
 	preempt_disable();
 
 	/* Ensure it is not in reserved area nor out of text */
-	if (!(core_kernel_text((unsigned long) p->addr) ||
-	    is_module_text_address((unsigned long) p->addr)) ||
-	    in_gate_area_no_mm((unsigned long) p->addr) ||
+	if (!kernel_text_address((unsigned long) p->addr) ||
 	    within_kprobe_blacklist((unsigned long) p->addr) ||
 	    jump_label_text_reserved(p->addr, p->addr) ||
 	    static_call_text_reserved(p->addr, p->addr) ||
@@ -1706,12 +1704,11 @@ static struct kprobe *__disable_kprobe(struct kprobe *p)
 		/* Try to disarm and disable this/parent probe */
 		if (p == orig_p || aggr_kprobe_disabled(orig_p)) {
 			/*
-			 * Don't be lazy here.  Even if 'kprobes_all_disarmed'
-			 * is false, 'orig_p' might not have been armed yet.
-			 * Note arm_all_kprobes() __tries__ to arm all kprobes
-			 * on the best effort basis.
+			 * If kprobes_all_disarmed is set, orig_p
+			 * should have already been disarmed, so
+			 * skip unneed disarming process.
 			 */
-			if (!kprobes_all_disarmed && !kprobe_disabled(orig_p)) {
+			if (!kprobes_all_disarmed) {
 				ret = disarm_kprobe(orig_p, true);
 				if (ret) {
 					p->flags &= ~KPROBE_FLAG_DISABLED;
@@ -1760,13 +1757,7 @@ static int __unregister_kprobe_top(struct kprobe *p)
 				if ((list_p != p) && (list_p->post_handler))
 					goto noclean;
 			}
-			/*
-			 * For the kprobe-on-ftrace case, we keep the
-			 * post_handler setting to identify this aggrprobe
-			 * armed with kprobe_ipmodify_ops.
-			 */
-			if (!kprobe_ftrace(ap))
-				ap->post_handler = NULL;
+			ap->post_handler = NULL;
 		}
 noclean:
 		/*
@@ -2214,11 +2205,8 @@ int enable_kprobe(struct kprobe *kp)
 	if (!kprobes_all_disarmed && kprobe_disabled(p)) {
 		p->flags &= ~KPROBE_FLAG_DISABLED;
 		ret = arm_kprobe(p);
-		if (ret) {
+		if (ret)
 			p->flags |= KPROBE_FLAG_DISABLED;
-			if (p != kp)
-				kp->flags |= KPROBE_FLAG_DISABLED;
-		}
 	}
 out:
 	mutex_unlock(&kprobe_mutex);

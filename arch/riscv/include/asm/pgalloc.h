@@ -38,13 +38,6 @@ static inline void pud_populate(struct mm_struct *mm, pud_t *pud, pmd_t *pmd)
 }
 #endif /* __PAGETABLE_PMD_FOLDED */
 
-static inline void sync_kernel_mappings(pgd_t *pgd)
-{
-	memcpy(pgd + USER_PTRS_PER_PGD,
-	       init_mm.pgd + USER_PTRS_PER_PGD,
-	       (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
-}
-
 static inline pgd_t *pgd_alloc(struct mm_struct *mm)
 {
 	pgd_t *pgd;
@@ -53,7 +46,9 @@ static inline pgd_t *pgd_alloc(struct mm_struct *mm)
 	if (likely(pgd != NULL)) {
 		memset(pgd, 0, USER_PTRS_PER_PGD * sizeof(pgd_t));
 		/* Copy kernel mappings */
-		sync_kernel_mappings(pgd);
+		memcpy(pgd + USER_PTRS_PER_PGD,
+			init_mm.pgd + USER_PTRS_PER_PGD,
+			(PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
 	}
 	return pgd;
 }

@@ -292,7 +292,7 @@ static int broadwell_audio_probe(struct platform_device *pdev)
 
 	broadwell_rt286.dev = &pdev->dev;
 
-	/* override platform name, if required */
+	/* override plaform name, if required */
 	mach = pdev->dev.platform_data;
 	ret = snd_soc_fixup_dai_links_platform_name(&broadwell_rt286,
 						    mach->mach_params.platform);

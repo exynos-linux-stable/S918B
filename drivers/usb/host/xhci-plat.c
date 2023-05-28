@@ -20,6 +20,8 @@
 #include <linux/acpi.h>
 #include <linux/usb/of.h>
 
+#include <trace/hooks/xhci.h>
+
 #include "xhci.h"
 #include "xhci-plat.h"
 #include "xhci-mvebu.h"
@@ -134,7 +136,7 @@ static const struct xhci_plat_priv xhci_plat_renesas_rcar_gen3 = {
 };
 
 static const struct xhci_plat_priv xhci_plat_brcm = {
-	.quirks = XHCI_RESET_ON_RESUME | XHCI_SUSPEND_RESUME_CLKS,
+	.quirks = XHCI_RESET_ON_RESUME,
 };
 
 static const struct of_device_id usb_xhci_of_match[] = {
@@ -447,16 +449,7 @@ static int __maybe_unused xhci_plat_suspend(struct device *dev)
 	 * xhci_suspend() needs `do_wakeup` to know whether host is allowed
 	 * to do wakeup during suspend.
 	 */
-	ret = xhci_suspend(xhci, device_may_wakeup(dev));
-	if (ret)
-		return ret;
-
-	if (!device_may_wakeup(dev) && (xhci->quirks & XHCI_SUSPEND_RESUME_CLKS)) {
-		clk_disable_unprepare(xhci->clk);
-		clk_disable_unprepare(xhci->reg_clk);
-	}
-
-	return 0;
+	return xhci_suspend(xhci, device_may_wakeup(dev));
 }
 
 static int __maybe_unused xhci_plat_resume(struct device *dev)
@@ -464,11 +457,6 @@ static int __maybe_unused xhci_plat_resume(struct device *dev)
 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
 	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
 	int ret;
-
-	if (!device_may_wakeup(dev) && (xhci->quirks & XHCI_SUSPEND_RESUME_CLKS)) {
-		clk_prepare_enable(xhci->clk);
-		clk_prepare_enable(xhci->reg_clk);
-	}
 
 	ret = xhci_priv_resume_quirk(hcd);
 	if (ret)
@@ -490,10 +478,15 @@ static int __maybe_unused xhci_plat_runtime_suspend(struct device *dev)
 	struct usb_hcd  *hcd = dev_get_drvdata(dev);
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
 	int ret;
+	int bypass = 0;
 
 	ret = xhci_priv_suspend_quirk(hcd);
 	if (ret)
 		return ret;
+
+	trace_android_vh_xhci_suspend(dev, &bypass);
+	if (bypass)
+		return 0;
 
 	return xhci_suspend(xhci, true);
 }
@@ -502,6 +495,11 @@ static int __maybe_unused xhci_plat_runtime_resume(struct device *dev)
 {
 	struct usb_hcd  *hcd = dev_get_drvdata(dev);
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+	int	bypass = 0;
+
+	trace_android_vh_xhci_resume(dev, &bypass);
+	if (bypass)
+		return 0;
 
 	return xhci_resume(xhci, 0);
 }

@@ -17,6 +17,7 @@
 #include <linux/bio.h>
 #include <linux/sched/signal.h>
 #include <linux/migrate.h>
+#include <linux/cleancache.h>
 #include "trace.h"
 
 #include "../internal.h"
@@ -276,6 +277,15 @@ static loff_t iomap_readpage_iter(const struct iomap_iter *iter,
 		goto done;
 	}
 
+	if (iomap->type == IOMAP_MAPPED)
+		SetPageMappedToDisk(page);
+
+	if (cleancache_get_page(page) == 0) {
+		BUG_ON(iomap->type != IOMAP_MAPPED);
+		iomap_set_range_uptodate(page, poff, plen);
+		goto done;
+	}
+
 	ctx->cur_page_in_bio = true;
 	if (iop)
 		atomic_add(plen, &iop->read_bytes_pending);
@@ -525,8 +535,7 @@ iomap_write_failed(struct inode *inode, loff_t pos, unsigned len)
 	 * write started inside the existing inode size.
 	 */
 	if (pos + len > i_size)
-		truncate_pagecache_range(inode, max(pos, i_size),
-					 pos + len - 1);
+		truncate_pagecache_range(inode, max(pos, i_size), pos + len);
 }
 
 static int

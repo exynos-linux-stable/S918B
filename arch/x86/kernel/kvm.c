@@ -188,7 +188,7 @@ void kvm_async_pf_task_wake(u32 token)
 {
 	u32 key = hash_32(token, KVM_TASK_SLEEP_HASHBITS);
 	struct kvm_task_sleep_head *b = &async_pf_sleepers[key];
-	struct kvm_task_sleep_node *n, *dummy = NULL;
+	struct kvm_task_sleep_node *n;
 
 	if (token == ~0) {
 		apf_task_wake_all();
@@ -200,41 +200,28 @@ again:
 	n = _find_apf_task(b, token);
 	if (!n) {
 		/*
-		 * Async #PF not yet handled, add a dummy entry for the token.
-		 * Allocating the token must be down outside of the raw lock
-		 * as the allocator is preemptible on PREEMPT_RT kernels.
+		 * async PF was not yet handled.
+		 * Add dummy entry for the token.
 		 */
-		if (!dummy) {
+		n = kzalloc(sizeof(*n), GFP_ATOMIC);
+		if (!n) {
+			/*
+			 * Allocation failed! Busy wait while other cpu
+			 * handles async PF.
+			 */
 			raw_spin_unlock(&b->lock);
-			dummy = kzalloc(sizeof(*dummy), GFP_ATOMIC);
-
-			/*
-			 * Continue looping on allocation failure, eventually
-			 * the async #PF will be handled and allocating a new
-			 * node will be unnecessary.
-			 */
-			if (!dummy)
-				cpu_relax();
-
-			/*
-			 * Recheck for async #PF completion before enqueueing
-			 * the dummy token to avoid duplicate list entries.
-			 */
+			cpu_relax();
 			goto again;
 		}
-		dummy->token = token;
-		dummy->cpu = smp_processor_id();
-		init_swait_queue_head(&dummy->wq);
-		hlist_add_head(&dummy->link, &b->list);
-		dummy = NULL;
+		n->token = token;
+		n->cpu = smp_processor_id();
+		init_swait_queue_head(&n->wq);
+		hlist_add_head(&n->link, &b->list);
 	} else {
 		apf_task_wake_one(n);
 	}
 	raw_spin_unlock(&b->lock);
-
-	/* A dummy token might be allocated and ultimately not used.  */
-	if (dummy)
-		kfree(dummy);
+	return;
 }
 EXPORT_SYMBOL_GPL(kvm_async_pf_task_wake);
 
@@ -948,7 +935,7 @@ asm(
 "movq	__per_cpu_offset(,%rdi,8), %rax;"
 "cmpb	$0, " __stringify(KVM_STEAL_TIME_preempted) "+steal_time(%rax);"
 "setne	%al;"
-ASM_RET
+"ret;"
 ".size __raw_callee_save___kvm_vcpu_is_preempted, .-__raw_callee_save___kvm_vcpu_is_preempted;"
 ".popsection");
 

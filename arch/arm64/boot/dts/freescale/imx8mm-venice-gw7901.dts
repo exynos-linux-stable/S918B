@@ -675,7 +675,6 @@
 &usbotg2 {
 	dr_mode = "host";
 	vbus-supply = <&reg_usb2_vbus>;
-	over-current-active-low;
 	status = "okay";
 };
 

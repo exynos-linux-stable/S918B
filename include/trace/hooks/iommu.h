@@ -6,16 +6,13 @@
 
 #if !defined(_TRACE_HOOK_IOMMU_H) || defined(TRACE_HEADER_MULTI_READ)
 #define _TRACE_HOOK_IOMMU_H
-#include <trace/hooks/vendor_hooks.h>
 
 #include <linux/types.h>
 
-#ifdef __GENKSYMS__
+#include <trace/hooks/vendor_hooks.h>
+
+/* struct iova_domain */
 #include <linux/iova.h>
-#endif
-
-struct iova_domain;
-
 DECLARE_RESTRICTED_HOOK(android_rvh_iommu_setup_dma_ops,
 	TP_PROTO(struct device *dev, u64 dma_base, u64 dma_limit),
 	TP_ARGS(dev, dma_base, dma_limit), 1);

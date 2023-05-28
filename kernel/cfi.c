@@ -23,6 +23,18 @@
 #define cfi_failure_handler	__ubsan_handle_cfi_check_fail_abort
 #endif
 
+/*
+ * __cfi_check won't be linked against compiler generated one,
+ * if no KBUILD_CFLAGS_MODULE is passed to compiler.
+ * 
+ * extern void __cfi_check(uint64_t id, void *ptr, void *diag);
+ *
+ */
+void __weak __cfi_check(uint64_t id, void *ptr, void *diag)
+{
+	return;
+}
+
 static inline void handle_cfi_failure(void *ptr)
 {
 	if (IS_ENABLED(CONFIG_CFI_PERMISSIVE))
@@ -43,8 +55,6 @@ typedef u16 shadow_t;
 struct cfi_shadow {
 	/* Page index for the beginning of the shadow */
 	unsigned long base;
-	/* rcu to free old cfi_shadow asynchronously */
-	struct rcu_head rcu;
 	/* An array of __cfi_check locations (as indices to the shadow) */
 	shadow_t shadow[1];
 } __packed;
@@ -184,13 +194,6 @@ static void remove_module_from_shadow(struct cfi_shadow *s, struct module *mod,
 	}
 }
 
-static void free_shadow(struct rcu_head *rcu)
-{
-	struct cfi_shadow *old = container_of(rcu, struct cfi_shadow, rcu);
-
-	vfree(old);
-}
-
 typedef void (*update_shadow_fn)(struct cfi_shadow *, struct module *,
 			unsigned long min_addr, unsigned long max_addr);
 
@@ -220,10 +223,11 @@ static void update_shadow(struct module *mod, unsigned long base_addr,
 
 	rcu_assign_pointer(cfi_shadow, next);
 	mutex_unlock(&shadow_update_lock);
+	synchronize_rcu();
 
 	if (prev) {
 		set_memory_rw((unsigned long)prev, SHADOW_PAGES);
-		call_rcu(&prev->rcu, free_shadow);
+		vfree(prev);
 	}
 }
 
@@ -319,7 +323,7 @@ static inline cfi_check_fn find_check_fn(unsigned long ptr)
 	return fn;
 }
 
-static inline void __nocfi ___cfi_slowpath_diag(uint64_t id, void *ptr, void *diag)
+void __cfi_slowpath_diag(uint64_t id, void *ptr, void *diag)
 {
 	cfi_check_fn fn = find_check_fn((unsigned long)ptr);
 
@@ -327,11 +331,6 @@ static inline void __nocfi ___cfi_slowpath_diag(uint64_t id, void *ptr, void *di
 		fn(id, ptr, diag);
 	else /* Don't allow unchecked modules */
 		handle_cfi_failure(ptr);
-}
-
-void __cfi_slowpath_diag(uint64_t id, void *ptr, void *diag)
-{
-	___cfi_slowpath_diag(id, ptr, diag);
 }
 EXPORT_SYMBOL(__cfi_slowpath_diag);
 

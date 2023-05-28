@@ -1163,9 +1163,10 @@ int phylink_fwnode_phy_connect(struct phylink *pl,
 
 	ret = phy_attach_direct(pl->netdev, phy_dev, flags,
 				pl->link_interface);
-	phy_device_free(phy_dev);
-	if (ret)
+	if (ret) {
+		phy_device_free(phy_dev);
 		return ret;
+	}
 
 	ret = phylink_bringup_phy(pl, phy_dev, pl->link_config.interface);
 	if (ret)

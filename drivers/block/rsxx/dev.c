@@ -127,8 +127,6 @@ static blk_qc_t rsxx_submit_bio(struct bio *bio)
 	blk_status_t st = BLK_STS_IOERR;
 
 	blk_queue_split(&bio);
-	if (!bio)
-		return BLK_QC_T_NONE;
 
 	might_sleep();
 

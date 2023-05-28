@@ -1428,12 +1428,10 @@ static struct sdma_desc *sdma_transfer_init(struct sdma_channel *sdmac,
 		sdma_config_ownership(sdmac, false, true, false);
 
 	if (sdma_load_context(sdmac))
-		goto err_bd_out;
+		goto err_desc_out;
 
 	return desc;
 
-err_bd_out:
-	sdma_free_bd(desc);
 err_desc_out:
 	kfree(desc);
 err_out:
@@ -2266,7 +2264,7 @@ MODULE_DESCRIPTION("i.MX SDMA driver");
 #if IS_ENABLED(CONFIG_SOC_IMX6Q)
 MODULE_FIRMWARE("imx/sdma/sdma-imx6q.bin");
 #endif
-#if IS_ENABLED(CONFIG_SOC_IMX7D) || IS_ENABLED(CONFIG_SOC_IMX8M)
+#if IS_ENABLED(CONFIG_SOC_IMX7D)
 MODULE_FIRMWARE("imx/sdma/sdma-imx7d.bin");
 #endif
 MODULE_LICENSE("GPL");

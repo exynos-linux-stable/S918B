@@ -13,6 +13,10 @@
 #include <linux/slab.h>
 #include <linux/dmapool.h>
 #include <linux/dma-mapping.h>
+#if IS_ENABLED(CONFIG_USB_HOST_CERTIFICATION)
+#define MAX_HC_SLOT_LIMIT 15
+#endif
+
 
 #include "xhci.h"
 #include "xhci-trace.h"
@@ -644,7 +648,7 @@ struct xhci_stream_info *xhci_alloc_stream_info(struct xhci_hcd *xhci,
 			num_stream_ctxs, &stream_info->ctx_array_dma,
 			mem_flags);
 	if (!stream_info->stream_ctx_array)
-		goto cleanup_ring_array;
+		goto cleanup_ctx;
 	memset(stream_info->stream_ctx_array, 0,
 			sizeof(struct xhci_stream_ctx)*num_stream_ctxs);
 
@@ -705,11 +709,6 @@ cleanup_rings:
 	}
 	xhci_free_command(xhci, stream_info->free_streams_command);
 cleanup_ctx:
-	xhci_free_stream_ctx(xhci,
-		stream_info->num_stream_ctxs,
-		stream_info->stream_ctx_array,
-		stream_info->ctx_array_dma);
-cleanup_ring_array:
 	kfree(stream_info->stream_rings);
 cleanup_info:
 	kfree(stream_info);
@@ -900,19 +899,15 @@ void xhci_free_virt_device(struct xhci_hcd *xhci, int slot_id)
 		if (dev->eps[i].stream_info)
 			xhci_free_stream_info(xhci,
 					dev->eps[i].stream_info);
-		/*
-		 * Endpoints are normally deleted from the bandwidth list when
-		 * endpoints are dropped, before device is freed.
-		 * If host is dying or being removed then endpoints aren't
-		 * dropped cleanly, so delete the endpoint from list here.
-		 * Only applicable for hosts with software bandwidth checking.
+		/* Endpoints on the TT/root port lists should have been removed
+		 * when usb_disable_device() was called for the device.
+		 * We can't drop them anyway, because the udev might have gone
+		 * away by this point, and we can't tell what speed it was.
 		 */
-
-		if (!list_empty(&dev->eps[i].bw_endpoint_list)) {
-			list_del_init(&dev->eps[i].bw_endpoint_list);
-			xhci_dbg(xhci, "Slot %u endpoint %u not removed from BW list!\n",
-				 slot_id, i);
-		}
+		if (!list_empty(&dev->eps[i].bw_endpoint_list))
+			xhci_warn(xhci, "Slot %u endpoint %u "
+					"not removed from BW list!\n",
+					slot_id, i);
 	}
 	/* If this is a hub, free the TT(s) from the TT list */
 	xhci_free_tt_info(xhci, dev, slot_id);
@@ -977,12 +972,24 @@ int xhci_alloc_virt_device(struct xhci_hcd *xhci, int slot_id,
 {
 	struct xhci_virt_device *dev;
 	int i;
+#if IS_ENABLED(CONFIG_USB_HOST_CERTIFICATION)
+	int count = 0;
+#endif
 
 	/* Slot ID 0 is reserved */
 	if (slot_id == 0 || xhci->devs[slot_id]) {
 		xhci_warn(xhci, "Bad Slot ID %d\n", slot_id);
 		return 0;
 	}
+
+#if IS_ENABLED(CONFIG_USB_HOST_CERTIFICATION)
+	for (i = 0; i < MAX_HC_SLOTS; i++) {
+		if (xhci->devs[i] && xhci->devs[i]->udev)
+			count++;
+	}
+	if (count >= MAX_HC_SLOT_LIMIT)
+		goto fail2;
+#endif
 
 	dev = kzalloc(sizeof(*dev), flags);
 	if (!dev)
@@ -1041,6 +1048,10 @@ fail:
 	if (dev->out_ctx)
 		xhci_free_container_ctx(xhci, dev->out_ctx);
 	kfree(dev);
+
+#if IS_ENABLED(CONFIG_USB_HOST_CERTIFICATION)
+fail2:
+#endif
 
 	return 0;
 }

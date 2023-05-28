@@ -48,10 +48,10 @@
  * for all hugepage allocations.
  */
 unsigned long transparent_hugepage_flags __read_mostly =
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS) || defined(CONFIG_HUGEPAGE_POOL)
 	(1<<TRANSPARENT_HUGEPAGE_FLAG)|
 #endif
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE_MADVISE
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE_MADVISE) && !defined(CONFIG_HUGEPAGE_POOL)
 	(1<<TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG)|
 #endif
 	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG)|
@@ -593,8 +593,13 @@ out:
 }
 EXPORT_SYMBOL_GPL(thp_get_unmapped_area);
 
+#ifdef CONFIG_HUGEPAGE_POOL
+static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
+			struct page *page, gfp_t gfp, bool need_clear)
+#else
 static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
 			struct page *page, gfp_t gfp)
+#endif
 {
 	struct vm_area_struct *vma = vmf->vma;
 	pgtable_t pgtable;
@@ -617,7 +622,12 @@ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
 		goto release;
 	}
 
+#ifdef CONFIG_HUGEPAGE_POOL
+	if (need_clear)
+		clear_huge_page(page, vmf->address, HPAGE_PMD_NR);
+#else
 	clear_huge_page(page, vmf->address, HPAGE_PMD_NR);
+#endif
 	/*
 	 * The memory barrier inside __SetPageUptodate makes sure that
 	 * clear_huge_page writes become visible before the set_pmd_at()
@@ -774,13 +784,21 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 		return ret;
 	}
 	gfp = vma_thp_gfp_mask(vma);
+#ifdef CONFIG_HUGEPAGE_POOL
+	page = alloc_from_hugepage_pool(gfp, vma, haddr, HPAGE_PMD_ORDER);
+#else
 	page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
+#endif
 	if (unlikely(!page)) {
 		count_vm_event(THP_FAULT_FALLBACK);
 		return VM_FAULT_FALLBACK;
 	}
 	prep_transhuge_page(page);
+#ifdef CONFIG_HUGEPAGE_POOL
+	return __do_huge_pmd_anonymous_page(vmf, page, gfp, false);
+#else
 	return __do_huge_pmd_anonymous_page(vmf, page, gfp);
+#endif
 }
 
 static void insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
@@ -2893,15 +2911,14 @@ static void split_huge_pages_all(void)
 	unsigned long total = 0, split = 0;
 
 	pr_debug("Split all THPs\n");
-	for_each_zone(zone) {
-		if (!managed_zone(zone))
-			continue;
+	for_each_populated_zone(zone) {
 		max_zone_pfn = zone_end_pfn(zone);
 		for (pfn = zone->zone_start_pfn; pfn < max_zone_pfn; pfn++) {
-			int nr_pages;
+			if (!pfn_valid(pfn))
+				continue;
 
-			page = pfn_to_online_page(pfn);
-			if (!page || !get_page_unless_zero(page))
+			page = pfn_to_page(pfn);
+			if (!get_page_unless_zero(page))
 				continue;
 
 			if (zone != page_zone(page))
@@ -2912,10 +2929,8 @@ static void split_huge_pages_all(void)
 
 			total++;
 			lock_page(page);
-			nr_pages = thp_nr_pages(page);
 			if (!split_huge_page(page))
 				split++;
-			pfn += nr_pages - 1;
 			unlock_page(page);
 next:
 			put_page(page);

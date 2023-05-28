@@ -44,7 +44,7 @@
 
 &i2c0 {
 	status = "okay";
-	i2c-mux@75 {
+	pca9547@75 {
 		compatible = "nxp,pca9547";
 		reg = <0x75>;
 		#address-cells = <1>;

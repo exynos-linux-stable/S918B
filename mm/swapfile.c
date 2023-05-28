@@ -44,7 +44,6 @@
 #include <asm/tlbflush.h>
 #include <linux/swapops.h>
 #include <linux/swap_cgroup.h>
-#include <trace/hooks/bl_hib.h>
 
 static bool swap_count_continued(struct swap_info_struct *, pgoff_t,
 				 unsigned char);
@@ -1094,7 +1093,6 @@ start_over:
 			goto check_out;
 		pr_debug("scan_swap_map of si %d failed to find offset\n",
 			si->type);
-		cond_resched();
 
 		spin_lock(&swap_avail_lock);
 nextsi:
@@ -2529,7 +2527,6 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
 	struct filename *pathname;
 	int err, found = 0;
 	unsigned int old_block_size;
-	bool hibernation_swap = false;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
@@ -2619,14 +2616,10 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
 	flush_work(&p->discard_work);
 
 	destroy_swap_extents(p);
-
-	trace_android_vh_check_hibernation_swap(p->bdev, &hibernation_swap);
-
 	if (p->flags & SWP_CONTINUED)
 		free_swap_count_continuations(p);
 
-	if (!p->bdev || hibernation_swap ||
-			!blk_queue_nonrot(bdev_get_queue(p->bdev)))
+	if (!p->bdev || !blk_queue_nonrot(bdev_get_queue(p->bdev)))
 		atomic_dec(&nr_rotate_swap);
 
 	mutex_lock(&swapon_mutex);
@@ -3131,6 +3124,14 @@ static bool swap_discardable(struct swap_info_struct *si)
 	return true;
 }
 
+#if IS_ENABLED(CONFIG_ZRAM)
+zram_oem_func zram_oem_fn;
+unsigned long __nocfi zram_oem_fn_nocfi(int cmd, void *priv, unsigned long param)
+{
+	return zram_oem_fn(cmd, priv, param);
+}
+#endif
+
 SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 {
 	struct swap_info_struct *p;
@@ -3150,7 +3151,6 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 	struct page *page = NULL;
 	struct inode *inode = NULL;
 	bool inced_nr_rotate_swap = false;
-	bool hibernation_swap = false;
 
 	if (swap_flags & ~SWAP_FLAGS_VALID)
 		return -EINVAL;
@@ -3226,16 +3226,13 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		goto bad_swap_unlock_inode;
 	}
 
-	trace_android_vh_check_hibernation_swap(p->bdev, &hibernation_swap);
-
 	if (p->bdev && blk_queue_stable_writes(p->bdev->bd_disk->queue))
 		p->flags |= SWP_STABLE_WRITES;
 
 	if (p->bdev && p->bdev->bd_disk->fops->rw_page)
 		p->flags |= SWP_SYNCHRONOUS_IO;
 
-	if (p->bdev && !hibernation_swap &&
-				blk_queue_nonrot(bdev_get_queue(p->bdev))) {
+	if (p->bdev && blk_queue_nonrot(bdev_get_queue(p->bdev))) {
 		int cpu;
 		unsigned long ci, nr_cluster;
 
@@ -3401,6 +3398,15 @@ out:
 		inode_unlock(inode);
 	if (!error)
 		enable_swap_slots_cache();
+#if IS_ENABLED(CONFIG_ZRAM)
+	if (!error && !zram_oem_fn) {
+		const struct block_device_operations *ops;
+
+		ops = p->bdev->bd_disk->fops;
+		if (ops->android_oem_data1)
+			zram_oem_fn = (zram_oem_func)ops->android_oem_data1;
+	}
+#endif
 	return error;
 }
 

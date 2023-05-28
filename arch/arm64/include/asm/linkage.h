@@ -1,16 +1,17 @@
 #ifndef __ASM_LINKAGE_H
 #define __ASM_LINKAGE_H
 
-#ifdef __ASSEMBLY__
-#include <asm/assembler.h>
-#endif
-
 #define __ALIGN		.align 2
 #define __ALIGN_STR	".align 2"
 
 #if defined(CONFIG_ARM64_BTI_KERNEL) && defined(__aarch64__)
 
-#define BTI_C bti c ;
+/*
+ * Since current versions of gas reject the BTI instruction unless we
+ * set the architecture version to v8.5 we use the hint instruction
+ * instead.
+ */
+#define BTI_C hint 34 ;
 
 /*
  * When using in-kernel BTI we need to ensure that PCS-conformant assembly

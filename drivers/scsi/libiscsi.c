@@ -83,7 +83,7 @@ MODULE_PARM_DESC(debug_libiscsi_eh,
 				"%s " dbg_fmt, __func__, ##arg);	\
 	} while (0);
 
-inline void iscsi_conn_queue_xmit(struct iscsi_conn *conn)
+inline void iscsi_conn_queue_work(struct iscsi_conn *conn)
 {
 	struct Scsi_Host *shost = conn->session->host;
 	struct iscsi_host *ihost = shost_priv(shost);
@@ -91,17 +91,7 @@ inline void iscsi_conn_queue_xmit(struct iscsi_conn *conn)
 	if (ihost->workq)
 		queue_work(ihost->workq, &conn->xmitwork);
 }
-EXPORT_SYMBOL_GPL(iscsi_conn_queue_xmit);
-
-inline void iscsi_conn_queue_recv(struct iscsi_conn *conn)
-{
-	struct Scsi_Host *shost = conn->session->host;
-	struct iscsi_host *ihost = shost_priv(shost);
-
-	if (ihost->workq && !test_bit(ISCSI_CONN_FLAG_SUSPEND_RX, &conn->flags))
-		queue_work(ihost->workq, &conn->recvwork);
-}
-EXPORT_SYMBOL_GPL(iscsi_conn_queue_recv);
+EXPORT_SYMBOL_GPL(iscsi_conn_queue_work);
 
 static void __iscsi_update_cmdsn(struct iscsi_session *session,
 				 uint32_t exp_cmdsn, uint32_t max_cmdsn)
@@ -775,7 +765,7 @@ __iscsi_conn_send_pdu(struct iscsi_conn *conn, struct iscsi_hdr *hdr,
 			goto free_task;
 	} else {
 		list_add_tail(&task->running, &conn->mgmtqueue);
-		iscsi_conn_queue_xmit(conn);
+		iscsi_conn_queue_work(conn);
 	}
 
 	return task;
@@ -1523,7 +1513,7 @@ void iscsi_requeue_task(struct iscsi_task *task)
 		 */
 		iscsi_put_task(task);
 	}
-	iscsi_conn_queue_xmit(conn);
+	iscsi_conn_queue_work(conn);
 	spin_unlock_bh(&conn->session->frwd_lock);
 }
 EXPORT_SYMBOL_GPL(iscsi_requeue_task);
@@ -1792,7 +1782,7 @@ int iscsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *sc)
 		}
 	} else {
 		list_add_tail(&task->running, &conn->cmdqueue);
-		iscsi_conn_queue_xmit(conn);
+		iscsi_conn_queue_work(conn);
 	}
 
 	session->queued_cmdsn++;
@@ -1953,7 +1943,7 @@ EXPORT_SYMBOL_GPL(iscsi_suspend_queue);
 
 /**
  * iscsi_suspend_tx - suspend iscsi_data_xmit
- * @conn: iscsi conn to stop processing IO on.
+ * @conn: iscsi conn tp stop processing IO on.
  *
  * This function sets the suspend bit to prevent iscsi_data_xmit
  * from sending new IO, and if work is queued on the xmit thread
@@ -1966,30 +1956,15 @@ void iscsi_suspend_tx(struct iscsi_conn *conn)
 
 	set_bit(ISCSI_CONN_FLAG_SUSPEND_TX, &conn->flags);
 	if (ihost->workq)
-		flush_work(&conn->xmitwork);
+		flush_workqueue(ihost->workq);
 }
 EXPORT_SYMBOL_GPL(iscsi_suspend_tx);
 
 static void iscsi_start_tx(struct iscsi_conn *conn)
 {
 	clear_bit(ISCSI_CONN_FLAG_SUSPEND_TX, &conn->flags);
-	iscsi_conn_queue_xmit(conn);
+	iscsi_conn_queue_work(conn);
 }
-
-/**
- * iscsi_suspend_rx - Prevent recvwork from running again.
- * @conn: iscsi conn to stop.
- */
-void iscsi_suspend_rx(struct iscsi_conn *conn)
-{
-	struct Scsi_Host *shost = conn->session->host;
-	struct iscsi_host *ihost = shost_priv(shost);
-
-	set_bit(ISCSI_CONN_FLAG_SUSPEND_RX, &conn->flags);
-	if (ihost->workq)
-		flush_work(&conn->recvwork);
-}
-EXPORT_SYMBOL_GPL(iscsi_suspend_rx);
 
 /*
  * We want to make sure a ping is in flight. It has timed out.
@@ -2855,12 +2830,11 @@ static void iscsi_notify_host_removed(struct iscsi_cls_session *cls_session)
 /**
  * iscsi_host_remove - remove host and sessions
  * @shost: scsi host
- * @is_shutdown: true if called from a driver shutdown callout
  *
  * If there are any sessions left, this will initiate the removal and wait
  * for the completion.
  */
-void iscsi_host_remove(struct Scsi_Host *shost, bool is_shutdown)
+void iscsi_host_remove(struct Scsi_Host *shost)
 {
 	struct iscsi_host *ihost = shost_priv(shost);
 	unsigned long flags;
@@ -2869,11 +2843,7 @@ void iscsi_host_remove(struct Scsi_Host *shost, bool is_shutdown)
 	ihost->state = ISCSI_HOST_REMOVED;
 	spin_unlock_irqrestore(&ihost->lock, flags);
 
-	if (!is_shutdown)
-		iscsi_host_for_each_session(shost, iscsi_notify_host_removed);
-	else
-		iscsi_host_for_each_session(shost, iscsi_force_destroy_session);
-
+	iscsi_host_for_each_session(shost, iscsi_notify_host_removed);
 	wait_event_interruptible(ihost->session_removal_wq,
 				 ihost->num_sessions == 0);
 	if (signal_pending(current))
@@ -3024,32 +2994,17 @@ dec_session_count:
 }
 EXPORT_SYMBOL_GPL(iscsi_session_setup);
 
-/*
- * issi_session_remove - Remove session from iSCSI class.
- */
-void iscsi_session_remove(struct iscsi_cls_session *cls_session)
-{
-	struct iscsi_session *session = cls_session->dd_data;
-	struct Scsi_Host *shost = session->host;
-
-	iscsi_remove_session(cls_session);
-	/*
-	 * host removal only has to wait for its children to be removed from
-	 * sysfs, and iscsi_tcp needs to do iscsi_host_remove before freeing
-	 * the session, so drop the session count here.
-	 */
-	iscsi_host_dec_session_cnt(shost);
-}
-EXPORT_SYMBOL_GPL(iscsi_session_remove);
-
 /**
- * iscsi_session_free - Free iscsi session and it's resources
+ * iscsi_session_teardown - destroy session, host, and cls_session
  * @cls_session: iscsi session
  */
-void iscsi_session_free(struct iscsi_cls_session *cls_session)
+void iscsi_session_teardown(struct iscsi_cls_session *cls_session)
 {
 	struct iscsi_session *session = cls_session->dd_data;
 	struct module *owner = cls_session->transport->owner;
+	struct Scsi_Host *shost = session->host;
+
+	iscsi_remove_session(cls_session);
 
 	iscsi_pool_free(&session->cmdpool);
 	kfree(session->password);
@@ -3067,18 +3022,9 @@ void iscsi_session_free(struct iscsi_cls_session *cls_session)
 	kfree(session->discovery_parent_type);
 
 	iscsi_free_session(cls_session);
-	module_put(owner);
-}
-EXPORT_SYMBOL_GPL(iscsi_session_free);
 
-/**
- * iscsi_session_teardown - destroy session and cls_session
- * @cls_session: iscsi session
- */
-void iscsi_session_teardown(struct iscsi_cls_session *cls_session)
-{
-	iscsi_session_remove(cls_session);
-	iscsi_session_free(cls_session);
+	iscsi_host_dec_session_cnt(shost);
+	module_put(owner);
 }
 EXPORT_SYMBOL_GPL(iscsi_session_teardown);
 

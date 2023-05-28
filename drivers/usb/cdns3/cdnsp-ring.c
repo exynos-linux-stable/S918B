@@ -1763,14 +1763,9 @@ static u32 cdnsp_td_remainder(struct cdnsp_device *pdev,
 			      int trb_buff_len,
 			      unsigned int td_total_len,
 			      struct cdnsp_request *preq,
-			      bool more_trbs_coming,
-			      bool zlp)
+			      bool more_trbs_coming)
 {
 	u32 maxp, total_packet_count;
-
-	/* Before ZLP driver needs set TD_SIZE = 1. */
-	if (zlp)
-		return 1;
 
 	/* One TRB with a zero-length data packet. */
 	if (!more_trbs_coming || (transferred == 0 && trb_buff_len == 0) ||
@@ -1946,16 +1941,13 @@ int cdnsp_queue_bulk_tx(struct cdnsp_device *pdev, struct cdnsp_request *preq)
 		}
 
 		if (enqd_len + trb_buff_len >= full_len) {
-			if (need_zero_pkt && !zero_len_trb) {
-				zero_len_trb = true;
-			} else {
-				zero_len_trb = false;
-				field &= ~TRB_CHAIN;
-				field |= TRB_IOC;
-				more_trbs_coming = false;
-				need_zero_pkt = false;
-				preq->td.last_trb = ring->enqueue;
-			}
+			if (need_zero_pkt)
+				zero_len_trb = !zero_len_trb;
+
+			field &= ~TRB_CHAIN;
+			field |= TRB_IOC;
+			more_trbs_coming = false;
+			preq->td.last_trb = ring->enqueue;
 		}
 
 		/* Only set interrupt on short packet for OUT endpoints. */
@@ -1965,13 +1957,12 @@ int cdnsp_queue_bulk_tx(struct cdnsp_device *pdev, struct cdnsp_request *preq)
 		/* Set the TRB length, TD size, and interrupter fields. */
 		remainder = cdnsp_td_remainder(pdev, enqd_len, trb_buff_len,
 					       full_len, preq,
-					       more_trbs_coming,
-					       zero_len_trb);
+					       more_trbs_coming);
 
 		length_field = TRB_LEN(trb_buff_len) | TRB_TD_SIZE(remainder) |
 			TRB_INTR_TARGET(0);
 
-		cdnsp_queue_trb(pdev, ring, more_trbs_coming,
+		cdnsp_queue_trb(pdev, ring, more_trbs_coming | zero_len_trb,
 				lower_32_bits(send_addr),
 				upper_32_bits(send_addr),
 				length_field,
@@ -2006,11 +1997,10 @@ int cdnsp_queue_bulk_tx(struct cdnsp_device *pdev, struct cdnsp_request *preq)
 
 int cdnsp_queue_ctrl_tx(struct cdnsp_device *pdev, struct cdnsp_request *preq)
 {
-	u32 field, length_field, zlp = 0;
+	u32 field, length_field, remainder;
 	struct cdnsp_ep *pep = preq->pep;
 	struct cdnsp_ring *ep_ring;
 	int num_trbs;
-	u32 maxp;
 	int ret;
 
 	ep_ring = cdnsp_request_to_transfer_ring(pdev, preq);
@@ -2020,32 +2010,25 @@ int cdnsp_queue_ctrl_tx(struct cdnsp_device *pdev, struct cdnsp_request *preq)
 	/* 1 TRB for data, 1 for status */
 	num_trbs = (pdev->three_stage_setup) ? 2 : 1;
 
-	maxp = usb_endpoint_maxp(pep->endpoint.desc);
-
-	if (preq->request.zero && preq->request.length &&
-	    (preq->request.length % maxp == 0)) {
-		num_trbs++;
-		zlp = 1;
-	}
-
 	ret = cdnsp_prepare_transfer(pdev, preq, num_trbs);
 	if (ret)
 		return ret;
 
 	/* If there's data, queue data TRBs */
-	if (preq->request.length > 0) {
-		field = TRB_TYPE(TRB_DATA);
+	if (pdev->ep0_expect_in)
+		field = TRB_TYPE(TRB_DATA) | TRB_IOC;
+	else
+		field = TRB_ISP | TRB_TYPE(TRB_DATA) | TRB_IOC;
 
-		if (zlp)
-			field |= TRB_CHAIN;
-		else
-			field |= TRB_IOC | (pdev->ep0_expect_in ? 0 : TRB_ISP);
+	if (preq->request.length > 0) {
+		remainder = cdnsp_td_remainder(pdev, 0, preq->request.length,
+					       preq->request.length, preq, 1);
+
+		length_field = TRB_LEN(preq->request.length) |
+				TRB_TD_SIZE(remainder) | TRB_INTR_TARGET(0);
 
 		if (pdev->ep0_expect_in)
 			field |= TRB_DIR_IN;
-
-		length_field = TRB_LEN(preq->request.length) |
-			       TRB_TD_SIZE(zlp) | TRB_INTR_TARGET(0);
 
 		cdnsp_queue_trb(pdev, ep_ring, true,
 				lower_32_bits(preq->request.dma),
@@ -2053,20 +2036,6 @@ int cdnsp_queue_ctrl_tx(struct cdnsp_device *pdev, struct cdnsp_request *preq)
 				field | ep_ring->cycle_state |
 				TRB_SETUPID(pdev->setup_id) |
 				pdev->setup_speed);
-
-		if (zlp) {
-			field = TRB_TYPE(TRB_NORMAL) | TRB_IOC;
-
-			if (!pdev->ep0_expect_in)
-				field = TRB_ISP;
-
-			cdnsp_queue_trb(pdev, ep_ring, true,
-					lower_32_bits(preq->request.dma),
-					upper_32_bits(preq->request.dma), 0,
-					field | ep_ring->cycle_state |
-					TRB_SETUPID(pdev->setup_id) |
-					pdev->setup_speed);
-		}
 
 		pdev->ep0_stage = CDNSP_DATA_STAGE;
 	}
@@ -2104,8 +2073,7 @@ int cdnsp_cmd_stop_ep(struct cdnsp_device *pdev, struct cdnsp_ep *pep)
 	u32 ep_state = GET_EP_CTX_STATE(pep->out_ctx);
 	int ret = 0;
 
-	if (ep_state == EP_STATE_STOPPED || ep_state == EP_STATE_DISABLED ||
-	    ep_state == EP_STATE_HALTED) {
+	if (ep_state == EP_STATE_STOPPED || ep_state == EP_STATE_DISABLED) {
 		trace_cdnsp_ep_stopped_or_disabled(pep->out_ctx);
 		goto ep_stopped;
 	}
@@ -2254,7 +2222,7 @@ static int cdnsp_queue_isoc_tx(struct cdnsp_device *pdev,
 		/* Set the TRB length, TD size, & interrupter fields. */
 		remainder = cdnsp_td_remainder(pdev, running_total,
 					       trb_buff_len, td_len, preq,
-					       more_trbs_coming, 0);
+					       more_trbs_coming);
 
 		length_field = TRB_LEN(trb_buff_len) | TRB_INTR_TARGET(0);
 

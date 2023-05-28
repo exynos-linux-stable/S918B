@@ -333,10 +333,6 @@ static const struct hid_device_id hid_battery_quirks[] = {
 	  HID_BATTERY_QUIRK_IGNORE },
 	{ HID_I2C_DEVICE(USB_VENDOR_ID_ELAN, I2C_DEVICE_ID_SURFACE_GO_TOUCHSCREEN),
 	  HID_BATTERY_QUIRK_IGNORE },
-	{ HID_I2C_DEVICE(USB_VENDOR_ID_ELAN, I2C_DEVICE_ID_SURFACE_GO2_TOUCHSCREEN),
-	  HID_BATTERY_QUIRK_IGNORE },
-	{ HID_I2C_DEVICE(USB_VENDOR_ID_ELAN, I2C_DEVICE_ID_LENOVO_YOGA_C630_TOUCHSCREEN),
-	  HID_BATTERY_QUIRK_IGNORE },
 	{}
 };
 
@@ -1119,16 +1115,6 @@ static void hidinput_configure_usage(struct hid_input *hidinput, struct hid_fiel
 			return;
 		}
 		goto unknown;
-	case HID_UP_CAMERA:
-		switch (usage->hid & HID_USAGE) {
-		case 0x020:
-			map_key_clear(KEY_CAMERA_FOCUS);	break;
-		case 0x021:
-			map_key_clear(KEY_CAMERA);		break;
-		default:
-			goto ignore;
-		}
-		break;
 
 	case HID_UP_HPVENDOR:	/* Reported on a Dutch layout HP5308 */
 		set_bit(EV_REP, input->evbit);
@@ -1632,6 +1618,7 @@ static void hidinput_close(struct input_dev *dev)
 	hid_hw_close(hid);
 }
 
+#if 0
 static bool __hidinput_change_resolution_multipliers(struct hid_device *hid,
 		struct hid_report *report, bool use_logical_max)
 {
@@ -1712,6 +1699,7 @@ static void hidinput_change_resolution_multipliers(struct hid_device *hid)
 	/* refresh our structs */
 	hid_setup_resolution_multiplier(hid);
 }
+#endif
 
 static void report_features(struct hid_device *hid)
 {
@@ -2016,7 +2004,7 @@ int hidinput_connect(struct hid_device *hid, unsigned int force)
 		}
 	}
 
-	hidinput_change_resolution_multipliers(hid);
+	//hidinput_change_resolution_multipliers(hid);
 
 	list_for_each_entry_safe(hidinput, next, &hid->inputs, list) {
 		if (drv->input_configured &&

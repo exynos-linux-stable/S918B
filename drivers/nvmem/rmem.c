@@ -37,9 +37,9 @@ static int rmem_read(void *context, unsigned int offset,
 	 * but as of Dec 2020 this isn't possible on arm64.
 	 */
 	addr = memremap(priv->mem->base, available, MEMREMAP_WB);
-	if (!addr) {
+	if (IS_ERR(addr)) {
 		dev_err(priv->dev, "Failed to remap memory region\n");
-		return -ENOMEM;
+		return PTR_ERR(addr);
 	}
 
 	count = memory_read_from_buffer(val, bytes, &off, addr, available);

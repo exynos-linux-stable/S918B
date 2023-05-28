@@ -63,7 +63,7 @@ int mfill_atomic_install_pte(struct mm_struct *dst_mm, pmd_t *dst_pmd,
 	pte_t _dst_pte, *dst_pte;
 	bool writable = dst_vma->vm_flags & VM_WRITE;
 	bool vm_shared = dst_vma->vm_flags & VM_SHARED;
-	bool page_in_cache = page_mapping(page);
+	bool page_in_cache = page->mapping;
 	spinlock_t *ptl;
 	struct inode *inode;
 	pgoff_t offset, max_off;
@@ -227,20 +227,12 @@ static int mcontinue_atomic_pte(struct mm_struct *dst_mm,
 	struct page *page;
 	int ret;
 
-	ret = shmem_getpage(inode, pgoff, &page, SGP_NOALLOC);
-	/* Our caller expects us to return -EFAULT if we failed to find page. */
-	if (ret == -ENOENT)
-		ret = -EFAULT;
+	ret = shmem_getpage(inode, pgoff, &page, SGP_READ);
 	if (ret)
 		goto out;
 	if (!page) {
 		ret = -EFAULT;
 		goto out;
-	}
-
-	if (PageHWPoison(page)) {
-		ret = -EIO;
-		goto out_release;
 	}
 
 	ret = mfill_atomic_install_pte(dst_mm, dst_pmd, dst_vma, dst_addr,

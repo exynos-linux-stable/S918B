@@ -9,6 +9,7 @@
  */
 
 #include <crypto/skcipher.h>
+#include <linux/key.h>
 #include <linux/random.h>
 
 #include "fscrypt_private.h"
@@ -51,13 +52,6 @@ struct fscrypt_mode fscrypt_modes[] = {
 		.security_strength = 32,
 		.ivsize = 32,
 		.blk_crypto_mode = BLK_ENCRYPTION_MODE_ADIANTUM,
-	},
-	[FSCRYPT_MODE_AES_256_HCTR2] = {
-		.friendly_name = "AES-256-HCTR2",
-		.cipher_str = "hctr2(aes)",
-		.keysize = 32,
-		.security_strength = 32,
-		.ivsize = 32,
 	},
 };
 
@@ -163,7 +157,6 @@ void fscrypt_destroy_prepared_key(struct fscrypt_prepared_key *prep_key)
 {
 	crypto_free_skcipher(prep_key->tfm);
 	fscrypt_destroy_inline_crypt_key(prep_key);
-	memzero_explicit(prep_key, sizeof(*prep_key));
 }
 
 /* Given a per-file encryption key, set up the file's crypto transform object */
@@ -451,18 +444,20 @@ static bool fscrypt_valid_master_key_size(const struct fscrypt_master_key *mk,
 /*
  * Find the master key, then set up the inode's actual encryption key.
  *
- * If the master key is found in the filesystem-level keyring, then it is
- * returned in *mk_ret with its semaphore read-locked.  This is needed to ensure
- * that only one task links the fscrypt_info into ->mk_decrypted_inodes (as
- * multiple tasks may race to create an fscrypt_info for the same inode), and to
- * synchronize the master key being removed with a new inode starting to use it.
+ * If the master key is found in the filesystem-level keyring, then the
+ * corresponding 'struct key' is returned in *master_key_ret with its semaphore
+ * read-locked.  This is needed to ensure that only one task links the
+ * fscrypt_info into ->mk_decrypted_inodes (as multiple tasks may race to create
+ * an fscrypt_info for the same inode), and to synchronize the master key being
+ * removed with a new inode starting to use it.
  */
 static int setup_file_encryption_key(struct fscrypt_info *ci,
 				     bool need_dirhash_key,
-				     struct fscrypt_master_key **mk_ret)
+				     struct key **master_key_ret)
 {
+	struct key *key;
+	struct fscrypt_master_key *mk = NULL;
 	struct fscrypt_key_specifier mk_spec;
-	struct fscrypt_master_key *mk;
 	int err;
 
 	switch (ci->ci_policy.version) {
@@ -483,10 +478,11 @@ static int setup_file_encryption_key(struct fscrypt_info *ci,
 		return -EINVAL;
 	}
 
-	mk = fscrypt_find_master_key(ci->ci_inode->i_sb, &mk_spec);
-	if (!mk) {
-		if (ci->ci_policy.version != FSCRYPT_POLICY_V1)
-			return -ENOKEY;
+	key = fscrypt_find_master_key(ci->ci_inode->i_sb, &mk_spec);
+	if (IS_ERR(key)) {
+		if (key != ERR_PTR(-ENOKEY) ||
+		    ci->ci_policy.version != FSCRYPT_POLICY_V1)
+			return PTR_ERR(key);
 
 		err = fscrypt_select_encryption_impl(ci, false);
 		if (err)
@@ -500,7 +496,9 @@ static int setup_file_encryption_key(struct fscrypt_info *ci,
 		 */
 		return fscrypt_setup_v1_file_key_via_subscribed_keyrings(ci);
 	}
-	down_read(&mk->mk_sem);
+
+	mk = key->payload.data[0];
+	down_read(&key->sem);
 
 	/* Has the secret been removed (via FS_IOC_REMOVE_ENCRYPTION_KEY)? */
 	if (!is_master_key_secret_present(&mk->mk_secret)) {
@@ -532,53 +530,76 @@ static int setup_file_encryption_key(struct fscrypt_info *ci,
 	if (err)
 		goto out_release_key;
 
-	*mk_ret = mk;
+	*master_key_ret = key;
 	return 0;
 
 out_release_key:
-	up_read(&mk->mk_sem);
-	fscrypt_put_master_key(mk);
+	up_read(&key->sem);
+	key_put(key);
 	return err;
 }
 
 static void put_crypt_info(struct fscrypt_info *ci)
 {
-	struct fscrypt_master_key *mk;
+	struct key *key;
 
 	if (!ci)
 		return;
+
+#ifdef CONFIG_DDAR
+	dd_info_try_free(ci->ci_dd_info);
+#endif
 
 	if (ci->ci_direct_key)
 		fscrypt_put_direct_key(ci->ci_direct_key);
 	else if (ci->ci_owns_key)
 		fscrypt_destroy_prepared_key(&ci->ci_enc_key);
 
-	mk = ci->ci_master_key;
-	if (mk) {
+	key = ci->ci_master_key;
+	if (key) {
+		struct fscrypt_master_key *mk = key->payload.data[0];
+
 		/*
 		 * Remove this inode from the list of inodes that were unlocked
-		 * with the master key.  In addition, if we're removing the last
-		 * inode from a master key struct that already had its secret
-		 * removed, then complete the full removal of the struct.
+		 * with the master key.
+		 *
+		 * In addition, if we're removing the last inode from a key that
+		 * already had its secret removed, invalidate the key so that it
+		 * gets removed from ->s_master_keys.
 		 */
 		spin_lock(&mk->mk_decrypted_inodes_lock);
 		list_del(&ci->ci_master_key_link);
 		spin_unlock(&mk->mk_decrypted_inodes_lock);
-		fscrypt_put_master_key_activeref(mk);
+		if (refcount_dec_and_test(&mk->mk_refcount))
+			key_invalidate(key);
+		key_put(key);
 	}
 	memzero_explicit(ci, sizeof(*ci));
 	kmem_cache_free(fscrypt_info_cachep, ci);
 }
 
+#if defined(CONFIG_FSCRYPT_SDP) || defined(CONFIG_DDAR)
+struct fscrypt_knox_info {
+	u32 flag;
+	void *info; // sdp_info or dd_policy
+	void *ctx; // fscrypt_sdp_context or dd_crypt_context
+};
+#endif
+
 static int
 fscrypt_setup_encryption_info(struct inode *inode,
 			      const union fscrypt_policy *policy,
 			      const u8 nonce[FSCRYPT_FILE_NONCE_SIZE],
+#if defined(CONFIG_FSCRYPT_SDP) || defined(CONFIG_DDAR)
+			      bool need_dirhash_key,
+			      void *knox_info)
+#else
 			      bool need_dirhash_key)
+#endif
 {
 	struct fscrypt_info *crypt_info;
 	struct fscrypt_mode *mode;
-	struct fscrypt_master_key *mk = NULL;
+	struct key *master_key = NULL;
 	int res;
 
 	res = fscrypt_initialize(inode->i_sb->s_cop->flags);
@@ -588,6 +609,10 @@ fscrypt_setup_encryption_info(struct inode *inode,
 	crypt_info = kmem_cache_zalloc(fscrypt_info_cachep, GFP_KERNEL);
 	if (!crypt_info)
 		return -ENOMEM;
+
+#ifdef CONFIG_DDAR
+	crypt_info->ci_dd_info = NULL;
+#endif
 
 	crypt_info->ci_inode = inode;
 	crypt_info->ci_policy = *policy;
@@ -601,9 +626,27 @@ fscrypt_setup_encryption_info(struct inode *inode,
 	WARN_ON(mode->ivsize > FSCRYPT_MAX_IV_SIZE);
 	crypt_info->ci_mode = mode;
 
-	res = setup_file_encryption_key(crypt_info, need_dirhash_key, &mk);
+	res = setup_file_encryption_key(crypt_info, need_dirhash_key,
+					&master_key);
 	if (res)
 		goto out;
+
+#ifdef CONFIG_DDAR
+	if (knox_info) {
+		struct fscrypt_knox_info *knoxInfo = (struct fscrypt_knox_info *) knox_info;
+		if (fscrypt_ddar_protected(knoxInfo->flag)) {
+			struct dd_info *di = alloc_dd_info(inode, knoxInfo->info, knoxInfo->ctx);
+			if (IS_ERR(di)) {
+				dd_error("%s - failed to alloc dd_info(%d)\n", __func__, __LINE__);
+				res = PTR_ERR(di);
+
+				goto out;
+			}
+
+			crypt_info->ci_dd_info = di;
+		}
+	}
+#endif
 
 	/*
 	 * For existing inodes, multiple tasks may race to set ->i_crypt_info.
@@ -616,9 +659,12 @@ fscrypt_setup_encryption_info(struct inode *inode,
 		 * We won the race and set ->i_crypt_info to our crypt_info.
 		 * Now link it into the master key's inode list.
 		 */
-		if (mk) {
-			crypt_info->ci_master_key = mk;
-			refcount_inc(&mk->mk_active_refs);
+		if (master_key) {
+			struct fscrypt_master_key *mk =
+				master_key->payload.data[0];
+
+			refcount_inc(&mk->mk_refcount);
+			crypt_info->ci_master_key = key_get(master_key);
 			spin_lock(&mk->mk_decrypted_inodes_lock);
 			list_add(&crypt_info->ci_master_key_link,
 				 &mk->mk_decrypted_inodes);
@@ -626,11 +672,18 @@ fscrypt_setup_encryption_info(struct inode *inode,
 		}
 		crypt_info = NULL;
 	}
+#ifdef CONFIG_DDAR
+	if (crypt_info == NULL) {
+		if (inode->i_crypt_info && inode->i_crypt_info->ci_dd_info) {
+			fscrypt_dd_inc_count();
+		}
+	}
+#endif
 	res = 0;
 out:
-	if (mk) {
-		up_read(&mk->mk_sem);
-		fscrypt_put_master_key(mk);
+	if (master_key) {
+		up_read(&master_key->sem);
+		key_put(master_key);
 	}
 	put_crypt_info(crypt_info);
 	return res;
@@ -660,8 +713,15 @@ int fscrypt_get_encryption_info(struct inode *inode, bool allow_unsupported)
 	union fscrypt_context ctx;
 	union fscrypt_policy policy;
 
-	if (fscrypt_has_encryption_key(inode))
+	if (fscrypt_has_encryption_key(inode)) {
+#ifdef CONFIG_DDAR
+		if (fscrypt_dd_encrypted_inode(inode) && fscrypt_dd_is_locked()) {
+			dd_error("Failed to open a DDAR-protected file in lock state (ino:%ld)\n", inode->i_ino);
+			return -ENOKEY;
+		}
+#endif
 		return 0;
+	}
 
 	res = inode->i_sb->s_cop->get_context(inode, &ctx, sizeof(ctx));
 	if (res < 0) {
@@ -670,6 +730,25 @@ int fscrypt_get_encryption_info(struct inode *inode, bool allow_unsupported)
 		fscrypt_warn(inode, "Error %d getting encryption context", res);
 		return res;
 	}
+
+#if defined(CONFIG_FSCRYPT_SDP) || defined(CONFIG_DDAR)
+	switch (ctx.version) {
+	case FSCRYPT_CONTEXT_V1: {
+		if (res == offsetof(struct fscrypt_context_v1, knox_flags)) {
+			ctx.v1.knox_flags = 0;
+			res = sizeof(ctx.v1);
+		}
+		break;
+	}
+	case FSCRYPT_CONTEXT_V2: {
+		if (res == offsetof(struct fscrypt_context_v2, knox_flags)) {
+			ctx.v2.knox_flags = 0;
+			res = sizeof(ctx.v2);
+		}
+		break;
+	}
+	}
+#endif
 
 	res = fscrypt_policy_from_context(&policy, &ctx, res);
 	if (res) {
@@ -686,10 +765,42 @@ int fscrypt_get_encryption_info(struct inode *inode, bool allow_unsupported)
 		return -EINVAL;
 	}
 
+#if defined(CONFIG_FSCRYPT_SDP) || defined(CONFIG_DDAR)
+	if (fscrypt_has_knox_flags(&ctx)) {
+		struct fscrypt_knox_info knox_info;
+#ifdef CONFIG_DDAR
+		struct dd_crypt_context crypt_context;
+#endif
+
+		memset(&knox_info, 0, sizeof(knox_info));
+		knox_info.flag = fscrypt_knox_flags_from_context(&ctx);
+#ifdef CONFIG_DDAR
+		if (fscrypt_ddar_protected(knox_info.flag)) {
+			if (dd_read_crypt_context(inode, &crypt_context) != sizeof(struct dd_crypt_context)) {
+				dd_error("%s: failed to read dd crypt context (ino:%ld)\n", __func__, inode->i_ino);
+				return -EINVAL;
+			}
+
+			knox_info.info = (void *) &crypt_context.policy;
+			knox_info.ctx = (void *) &crypt_context;
+		}
+#endif
+		res = fscrypt_setup_encryption_info(inode, &policy,
+						    fscrypt_context_nonce(&ctx),
+						    IS_CASEFOLDED(inode) &&
+						    S_ISDIR(inode->i_mode), &knox_info);
+	} else {
+		res = fscrypt_setup_encryption_info(inode, &policy,
+						    fscrypt_context_nonce(&ctx),
+						    IS_CASEFOLDED(inode) &&
+						    S_ISDIR(inode->i_mode), NULL);
+	}
+#else
 	res = fscrypt_setup_encryption_info(inode, &policy,
 					    fscrypt_context_nonce(&ctx),
 					    IS_CASEFOLDED(inode) &&
 					    S_ISDIR(inode->i_mode));
+#endif
 
 	if (res == -ENOPKG && allow_unsupported) /* Algorithm unavailable? */
 		res = 0;
@@ -723,6 +834,9 @@ int fscrypt_prepare_new_inode(struct inode *dir, struct inode *inode,
 			      bool *encrypt_ret)
 {
 	const union fscrypt_policy *policy;
+#if defined(CONFIG_FSCRYPT_SDP) || defined(CONFIG_DDAR)
+	struct fscrypt_info *ci;
+#endif
 	u8 nonce[FSCRYPT_FILE_NONCE_SIZE];
 
 	policy = fscrypt_policy_to_inherit(dir);
@@ -746,9 +860,41 @@ int fscrypt_prepare_new_inode(struct inode *dir, struct inode *inode,
 	*encrypt_ret = true;
 
 	get_random_bytes(nonce, FSCRYPT_FILE_NONCE_SIZE);
+
+#if defined(CONFIG_FSCRYPT_SDP) || defined(CONFIG_DDAR)
+	ci = fscrypt_has_dar_info(dir);
+	if (ci) {
+		struct fscrypt_knox_info knox_info;
+
+		memset(&knox_info, 0, sizeof(knox_info));
+
+#ifdef CONFIG_DDAR
+		if (ci->ci_dd_info) {
+			if (fscrypt_dd_is_locked()
+					&& !fscrypt_dd_flg_gid_restricted(
+							(ci->ci_dd_info->policy.flags << FSCRYPT_KNOX_FLG_DDAR_SHIFT), 0)) {
+				dd_error("%s - Failed to open a DDAR-protected (CE) file in lock state (ino:%ld)\n", __func__, inode->i_ino);
+				return -ENOKEY;
+			}
+
+			knox_info.flag |= ((ci->ci_dd_info->policy.flags << FSCRYPT_KNOX_FLG_DDAR_SHIFT) & FSCRYPT_KNOX_FLG_DDAR_MASK);
+			knox_info.info = (void *) &ci->ci_dd_info->policy;
+			knox_info.ctx = NULL;
+		}
+#endif
+		return fscrypt_setup_encryption_info(inode, policy, nonce,
+						     IS_CASEFOLDED(dir) &&
+						     S_ISDIR(inode->i_mode), &knox_info);
+	} else {
+		return fscrypt_setup_encryption_info(inode, policy, nonce,
+						     IS_CASEFOLDED(dir) &&
+						     S_ISDIR(inode->i_mode), NULL);
+	}
+#else
 	return fscrypt_setup_encryption_info(inode, policy, nonce,
 					     IS_CASEFOLDED(dir) &&
 					     S_ISDIR(inode->i_mode));
+#endif
 }
 EXPORT_SYMBOL_GPL(fscrypt_prepare_new_inode);
 
@@ -761,6 +907,11 @@ EXPORT_SYMBOL_GPL(fscrypt_prepare_new_inode);
  */
 void fscrypt_put_encryption_info(struct inode *inode)
 {
+#ifdef CONFIG_DDAR
+	if (inode->i_crypt_info && inode->i_crypt_info->ci_dd_info) {
+		fscrypt_dd_dec_count();
+	}
+#endif
 	put_crypt_info(inode->i_crypt_info);
 	inode->i_crypt_info = NULL;
 }
@@ -795,6 +946,7 @@ EXPORT_SYMBOL(fscrypt_free_inode);
 int fscrypt_drop_inode(struct inode *inode)
 {
 	const struct fscrypt_info *ci = fscrypt_get_info(inode);
+	const struct fscrypt_master_key *mk;
 
 	/*
 	 * If ci is NULL, then the inode doesn't have an encryption key set up
@@ -804,6 +956,7 @@ int fscrypt_drop_inode(struct inode *inode)
 	 */
 	if (!ci || !ci->ci_master_key)
 		return 0;
+	mk = ci->ci_master_key->payload.data[0];
 
 	/*
 	 * With proper, non-racy use of FS_IOC_REMOVE_ENCRYPTION_KEY, all inodes
@@ -822,6 +975,190 @@ int fscrypt_drop_inode(struct inode *inode)
 	 * then the thread removing the key will either evict the inode itself
 	 * or will correctly detect that it wasn't evicted due to the race.
 	 */
-	return !is_master_key_secret_present(&ci->ci_master_key->mk_secret);
+	return !is_master_key_secret_present(&mk->mk_secret);
 }
 EXPORT_SYMBOL_GPL(fscrypt_drop_inode);
+
+#ifdef CONFIG_DDAR
+static inline int __find_and_derive_mode_key(
+		struct fscrypt_key *fskey,
+		struct fscrypt_info *ci,
+		struct fscrypt_master_key *mk,
+		u8 hkdf_context, bool include_fs_uuid)
+{
+	const struct inode *inode = ci->ci_inode;
+	/*const */struct super_block *sb = inode->i_sb;
+	struct fscrypt_mode *mode = ci->ci_mode;
+	const u8 mode_num = mode - fscrypt_modes;
+	u8 mode_key[FSCRYPT_MAX_KEY_SIZE];
+	u8 hkdf_info[sizeof(mode_num) + sizeof(sb->s_uuid)];
+	unsigned int hkdf_infolen = 0;
+	int err;
+
+	if (WARN_ON(mode_num > FSCRYPT_MODE_MAX))
+		return -EINVAL;
+
+	mutex_lock(&fscrypt_mode_key_setup_mutex);
+
+	if (mk->mk_secret.is_hw_wrapped && S_ISREG(inode->i_mode)) {
+		u8 kdf_key[32];
+		unsigned int kdf_key_size = 32;
+		if (!fscrypt_using_inline_encryption(ci)) {
+			fscrypt_warn(ci->ci_inode,
+				     "Hardware-wrapped keys require inline encryption (-o inlinecrypt)");
+			err = -EINVAL;
+			goto out_unlock;
+		}
+//		err = -EOPNOTSUPP;
+		err = fscrypt_derive_raw_secret(sb, mk->mk_secret.raw,
+						mk->mk_secret.size,
+						kdf_key, kdf_key_size);
+		if (err)
+			goto out_unlock;
+
+		memcpy(fskey->raw, kdf_key, kdf_key_size);
+		fskey->size = kdf_key_size;
+		memzero_explicit(kdf_key, kdf_key_size);
+
+	} else {
+		BUILD_BUG_ON(sizeof(mode_num) != 1);
+		BUILD_BUG_ON(sizeof(sb->s_uuid) != 16);
+		BUILD_BUG_ON(sizeof(hkdf_info) != 17);
+		hkdf_info[hkdf_infolen++] = mode_num;
+		if (include_fs_uuid) {
+			memcpy(&hkdf_info[hkdf_infolen], &sb->s_uuid,
+				   sizeof(sb->s_uuid));
+			hkdf_infolen += sizeof(sb->s_uuid);
+		}
+		err = fscrypt_hkdf_expand(&mk->mk_secret.hkdf,
+					  hkdf_context, hkdf_info, hkdf_infolen,
+					  mode_key, mode->keysize);
+		if (err)
+			goto out_unlock;
+
+		memcpy(fskey->raw, mode_key, mode->keysize);
+		fskey->size = mode->keysize;
+		memzero_explicit(mode_key, mode->keysize);
+	}
+
+out_unlock:
+	mutex_unlock(&fscrypt_mode_key_setup_mutex);
+	return err;
+}
+
+static inline int __find_and_derive_fskey(
+					struct fscrypt_info *ci,
+					struct fscrypt_key *fskey)
+{
+	struct key *key;
+	struct fscrypt_master_key *mk = NULL;
+	struct fscrypt_key_specifier mk_spec;
+	int err;
+
+	switch (ci->ci_policy.version) {
+//	case FSCRYPT_POLICY_V1:
+//		mk_spec.type = FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR;
+//		memcpy(mk_spec.u.descriptor,
+//		       ci->ci_policy.v1.master_key_descriptor,
+//		       FSCRYPT_KEY_DESCRIPTOR_SIZE);
+//		break;
+	case FSCRYPT_POLICY_V2:
+		mk_spec.type = FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER;
+		memcpy(mk_spec.u.identifier,
+		       ci->ci_policy.v2.master_key_identifier,
+		       FSCRYPT_KEY_IDENTIFIER_SIZE);
+		break;
+	default:
+		WARN_ON(1);
+		return -EINVAL;
+	}
+
+	key = fscrypt_find_master_key(ci->ci_inode->i_sb, &mk_spec);
+	if (IS_ERR(key))
+		return PTR_ERR(key);
+
+	mk = key->payload.data[0];
+	down_read(&key->sem);
+
+	/* Has the secret been removed (via FS_IOC_REMOVE_ENCRYPTION_KEY)? */
+	if (!is_master_key_secret_present(&mk->mk_secret)) {
+		err = -ENOKEY;
+		goto out_release_key;
+	}
+
+	if (!fscrypt_valid_master_key_size(mk, ci)) {
+		err = -ENOKEY;
+		goto out_release_key;
+	}
+
+	err = fscrypt_select_encryption_impl(ci, mk->mk_secret.is_hw_wrapped);
+	if (err)
+		goto out_release_key;
+
+	if (mk->mk_secret.is_hw_wrapped &&
+	    !(ci->ci_policy.v2.flags & (FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64 |
+					FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32))) {
+		fscrypt_warn(ci->ci_inode,
+			     "Hardware-wrapped keys are only supported with IV_INO_LBLK policies");
+		err = -EINVAL;
+		goto out_release_key;
+	}
+
+	if (ci->ci_policy.v2.flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY) {
+		err = __find_and_derive_mode_key(fskey, ci, mk,
+				HKDF_CONTEXT_DIRECT_KEY, false);
+	} else if (ci->ci_policy.v2.flags &
+		   FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64) {
+		err = __find_and_derive_mode_key(fskey, ci, mk,
+				HKDF_CONTEXT_IV_INO_LBLK_64_KEY, true);
+		if (err == 0)
+			fskey->size = ci->ci_mode->keysize;
+	} else if (ci->ci_policy.v2.flags &
+		   FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32) {
+		err = -EOPNOTSUPP;
+	} else {
+		err = fscrypt_hkdf_expand(&mk->mk_secret.hkdf,
+					  HKDF_CONTEXT_PER_FILE_ENC_KEY,
+					  ci->ci_nonce,
+					  FSCRYPT_FILE_NONCE_SIZE,
+					  fskey->raw, ci->ci_mode->keysize);
+		if (err == 0)
+			fskey->size = ci->ci_mode->keysize;
+	}
+
+out_release_key:
+	up_read(&key->sem);
+	key_put(key);
+	return err;
+}
+
+int fscrypt_get_encryption_key(
+		struct fscrypt_info *crypt_info,
+		struct fscrypt_key *key)
+{
+	struct fscrypt_key *kek = NULL;
+	int res;
+
+	if (!crypt_info || !(kek = key))
+		return -EINVAL;
+
+	res = fscrypt_get_encryption_kek(crypt_info, kek);
+
+	return res;
+}
+EXPORT_SYMBOL(fscrypt_get_encryption_key);
+
+int fscrypt_get_encryption_kek(
+		struct fscrypt_info *crypt_info,
+		struct fscrypt_key *kek)
+{
+	int res;
+
+	if (!crypt_info)
+		return -EINVAL;
+
+	res = __find_and_derive_fskey(crypt_info, kek);
+	return res;
+}
+EXPORT_SYMBOL(fscrypt_get_encryption_kek);
+#endif

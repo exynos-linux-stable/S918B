@@ -14,7 +14,6 @@
 #include <strings.h>
 #include <signal.h>
 #include <unistd.h>
-#include <time.h>
 
 #include <sys/poll.h>
 #include <sys/sendfile.h>
@@ -65,7 +64,6 @@ static int cfg_sndbuf;
 static int cfg_rcvbuf;
 static bool cfg_join;
 static bool cfg_remove;
-static unsigned int cfg_time;
 static unsigned int cfg_do_w;
 static int cfg_wait;
 static uint32_t cfg_mark;
@@ -80,10 +78,9 @@ static struct cfg_cmsg_types cfg_cmsg_types;
 static void die_usage(void)
 {
 	fprintf(stderr, "Usage: mptcp_connect [-6] [-u] [-s MPTCP|TCP] [-p port] [-m mode]"
-		"[-l] [-w sec] [-t num] [-T num] connect_address\n");
+		"[-l] [-w sec] connect_address\n");
 	fprintf(stderr, "\t-6 use ipv6\n");
 	fprintf(stderr, "\t-t num -- set poll timeout to num\n");
-	fprintf(stderr, "\t-T num -- set expected runtime to num ms\n");
 	fprintf(stderr, "\t-S num -- set SO_SNDBUF to num\n");
 	fprintf(stderr, "\t-R num -- set SO_RCVBUF to num\n");
 	fprintf(stderr, "\t-p num -- use port num\n");
@@ -451,7 +448,7 @@ static void set_nonblock(int fd)
 	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static int copyfd_io_poll(int infd, int peerfd, int outfd, bool *in_closed_after_out)
+static int copyfd_io_poll(int infd, int peerfd, int outfd)
 {
 	struct pollfd fds = {
 		.fd = peerfd,
@@ -490,11 +487,9 @@ static int copyfd_io_poll(int infd, int peerfd, int outfd, bool *in_closed_after
 				 */
 				fds.events &= ~POLLIN;
 
-				if ((fds.events & POLLOUT) == 0) {
-					*in_closed_after_out = true;
+				if ((fds.events & POLLOUT) == 0)
 					/* and nothing more to send */
 					break;
-				}
 
 			/* Else, still have data to transmit */
 			} else if (len < 0) {
@@ -552,7 +547,7 @@ static int copyfd_io_poll(int infd, int peerfd, int outfd, bool *in_closed_after
 	}
 
 	/* leave some time for late join/announce */
-	if (cfg_remove)
+	if (cfg_join || cfg_remove)
 		usleep(cfg_wait);
 
 	close(peerfd);
@@ -651,7 +646,7 @@ static int do_sendfile(int infd, int outfd, unsigned int count)
 }
 
 static int copyfd_io_mmap(int infd, int peerfd, int outfd,
-			  unsigned int size, bool *in_closed_after_out)
+			  unsigned int size)
 {
 	int err;
 
@@ -669,14 +664,13 @@ static int copyfd_io_mmap(int infd, int peerfd, int outfd,
 		shutdown(peerfd, SHUT_WR);
 
 		err = do_recvfile(peerfd, outfd);
-		*in_closed_after_out = true;
 	}
 
 	return err;
 }
 
 static int copyfd_io_sendfile(int infd, int peerfd, int outfd,
-			      unsigned int size, bool *in_closed_after_out)
+			      unsigned int size)
 {
 	int err;
 
@@ -691,7 +685,6 @@ static int copyfd_io_sendfile(int infd, int peerfd, int outfd,
 		if (err)
 			return err;
 		err = do_recvfile(peerfd, outfd);
-		*in_closed_after_out = true;
 	}
 
 	return err;
@@ -699,62 +692,27 @@ static int copyfd_io_sendfile(int infd, int peerfd, int outfd,
 
 static int copyfd_io(int infd, int peerfd, int outfd)
 {
-	bool in_closed_after_out = false;
-	struct timespec start, end;
 	int file_size;
-	int ret;
-
-	if (cfg_time && (clock_gettime(CLOCK_MONOTONIC, &start) < 0))
-		xerror("can not fetch start time %d", errno);
 
 	switch (cfg_mode) {
 	case CFG_MODE_POLL:
-		ret = copyfd_io_poll(infd, peerfd, outfd, &in_closed_after_out);
-		break;
-
+		return copyfd_io_poll(infd, peerfd, outfd);
 	case CFG_MODE_MMAP:
 		file_size = get_infd_size(infd);
 		if (file_size < 0)
 			return file_size;
-		ret = copyfd_io_mmap(infd, peerfd, outfd, file_size, &in_closed_after_out);
-		break;
-
+		return copyfd_io_mmap(infd, peerfd, outfd, file_size);
 	case CFG_MODE_SENDFILE:
 		file_size = get_infd_size(infd);
 		if (file_size < 0)
 			return file_size;
-		ret = copyfd_io_sendfile(infd, peerfd, outfd, file_size, &in_closed_after_out);
-		break;
-
-	default:
-		fprintf(stderr, "Invalid mode %d\n", cfg_mode);
-
-		die_usage();
-		return 1;
+		return copyfd_io_sendfile(infd, peerfd, outfd, file_size);
 	}
 
-	if (ret)
-		return ret;
+	fprintf(stderr, "Invalid mode %d\n", cfg_mode);
 
-	if (cfg_time) {
-		unsigned int delta_ms;
-
-		if (clock_gettime(CLOCK_MONOTONIC, &end) < 0)
-			xerror("can not fetch end time %d", errno);
-		delta_ms = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
-		if (delta_ms > cfg_time) {
-			xerror("transfer slower than expected! runtime %d ms, expected %d ms",
-			       delta_ms, cfg_time);
-		}
-
-		/* show the runtime only if this end shutdown(wr) before receiving the EOF,
-		 * (that is, if this end got the longer runtime)
-		 */
-		if (in_closed_after_out)
-			fprintf(stderr, "%d", delta_ms);
-	}
-
-	return 0;
+	die_usage();
+	return 1;
 }
 
 static void check_sockaddr(int pf, struct sockaddr_storage *ss,
@@ -1047,11 +1005,12 @@ static void parse_opts(int argc, char **argv)
 {
 	int c;
 
-	while ((c = getopt(argc, argv, "6jr:lp:s:hut:T:m:S:R:w:M:P:c:")) != -1) {
+	while ((c = getopt(argc, argv, "6jr:lp:s:hut:m:S:R:w:M:P:c:")) != -1) {
 		switch (c) {
 		case 'j':
 			cfg_join = true;
 			cfg_mode = CFG_MODE_POLL;
+			cfg_wait = 400000;
 			break;
 		case 'r':
 			cfg_remove = true;
@@ -1083,9 +1042,6 @@ static void parse_opts(int argc, char **argv)
 			poll_timeout = atoi(optarg) * 1000;
 			if (poll_timeout <= 0)
 				poll_timeout = -1;
-			break;
-		case 'T':
-			cfg_time = atoi(optarg);
 			break;
 		case 'm':
 			cfg_mode = parse_mode(optarg);

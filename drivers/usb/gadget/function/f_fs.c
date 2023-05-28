@@ -122,6 +122,8 @@ struct ffs_ep {
 	struct usb_endpoint_descriptor	*descs[3];
 
 	u8				num;
+
+	int				status;	/* P: epfile->mutex */
 };
 
 struct ffs_epfile {
@@ -225,9 +227,6 @@ struct ffs_io_data {
 	bool use_sg;
 
 	struct ffs_data *ffs;
-
-	int status;
-	struct completion done;
 };
 
 struct ffs_desc_helper {
@@ -278,11 +277,6 @@ static int __ffs_ep0_queue_wait(struct ffs_data *ffs, char *data, size_t len)
 {
 	struct usb_request *req = ffs->ep0req;
 	int ret;
-
-	if (!req) {
-		spin_unlock_irq(&ffs->ev.waitq.lock);
-		return -EINVAL;
-	}
 
 	req->zero     = len < le16_to_cpu(ffs->ev.setup.wLength);
 
@@ -713,15 +707,12 @@ static const struct file_operations ffs_ep0_operations = {
 
 static void ffs_epfile_io_complete(struct usb_ep *_ep, struct usb_request *req)
 {
-	struct ffs_io_data *io_data = req->context;
-
 	ENTER();
-	if (req->status)
-		io_data->status = req->status;
-	else
-		io_data->status = req->actual;
-
-	complete(&io_data->done);
+	if (req->context) {
+		struct ffs_ep *ep = _ep->driver_data;
+		ep->status = req->status ? req->status : req->actual;
+		complete(req->context);
+	}
 }
 
 static ssize_t ffs_copy_to_iter(void *data, int data_len, struct iov_iter *iter)
@@ -1059,6 +1050,7 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 		WARN(1, "%s: data_len == -EINVAL\n", __func__);
 		ret = -EINVAL;
 	} else if (!io_data->aio) {
+		DECLARE_COMPLETION_ONSTACK(done);
 		bool interrupted = false;
 
 		req = ep->req;
@@ -1074,8 +1066,7 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 
 		io_data->buf = data;
 
-		init_completion(&io_data->done);
-		req->context  = io_data;
+		req->context  = &done;
 		req->complete = ffs_epfile_io_complete;
 
 		ret = usb_ep_queue(ep->ep, req, GFP_ATOMIC);
@@ -1084,12 +1075,7 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 
 		spin_unlock_irq(&epfile->ffs->eps_lock);
 
-		if (wait_for_completion_interruptible(&io_data->done)) {
-			spin_lock_irq(&epfile->ffs->eps_lock);
-			if (epfile->ep != ep) {
-				ret = -ESHUTDOWN;
-				goto error_lock;
-			}
+		if (wait_for_completion_interruptible(&done)) {
 			/*
 			 * To avoid race condition with ffs_epfile_io_complete,
 			 * dequeue the request first then check
@@ -1097,18 +1083,17 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 			 * condition with req->complete callback.
 			 */
 			usb_ep_dequeue(ep->ep, req);
-			spin_unlock_irq(&epfile->ffs->eps_lock);
-			wait_for_completion(&io_data->done);
-			interrupted = io_data->status < 0;
+			wait_for_completion(&done);
+			interrupted = ep->status < 0;
 		}
 
 		if (interrupted)
 			ret = -EINTR;
-		else if (io_data->read && io_data->status > 0)
-			ret = __ffs_epfile_read_data(epfile, data, io_data->status,
+		else if (io_data->read && ep->status > 0)
+			ret = __ffs_epfile_read_data(epfile, data, ep->status,
 						     &io_data->data);
 		else
-			ret = io_data->status;
+			ret = ep->status;
 		goto error_mutex;
 	} else if (!(req = usb_ep_alloc_request(ep->ep, GFP_ATOMIC))) {
 		ret = -ENOMEM;
@@ -1897,14 +1882,10 @@ static void functionfs_unbind(struct ffs_data *ffs)
 	ENTER();
 
 	if (!WARN_ON(!ffs->gadget)) {
-		/* dequeue before freeing ep0req */
-		usb_ep_dequeue(ffs->gadget->ep0, ffs->ep0req);
-		mutex_lock(&ffs->mutex);
 		usb_ep_free_request(ffs->gadget->ep0, ffs->ep0req);
 		ffs->ep0req = NULL;
 		ffs->gadget = NULL;
 		clear_bit(FFS_FL_BOUND, &ffs->flags);
-		mutex_unlock(&ffs->mutex);
 		ffs_data_put(ffs);
 	}
 }
@@ -3709,7 +3690,7 @@ int ffs_name_dev(struct ffs_dev *dev, const char *name)
 
 	existing = _ffs_do_find_dev(name);
 	if (!existing)
-		strscpy(dev->name, name, ARRAY_SIZE(dev->name));
+		strlcpy(dev->name, name, ARRAY_SIZE(dev->name));
 	else if (existing != dev)
 		ret = -EBUSY;
 

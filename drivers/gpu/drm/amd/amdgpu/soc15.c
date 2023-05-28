@@ -689,7 +689,7 @@ static void soc15_pcie_gen3_enable(struct amdgpu_device *adev)
 
 static void soc15_program_aspm(struct amdgpu_device *adev)
 {
-	if (!amdgpu_device_should_use_aspm(adev))
+	if (!amdgpu_aspm)
 		return;
 
 	if (!(adev->flags & AMD_IS_APU) &&
@@ -1416,17 +1416,22 @@ static int soc15_common_sw_fini(void *handle)
 	return 0;
 }
 
-static void soc15_sdma_doorbell_range_init(struct amdgpu_device *adev)
+static void soc15_doorbell_range_init(struct amdgpu_device *adev)
 {
 	int i;
+	struct amdgpu_ring *ring;
 
-	/* sdma doorbell range is programed by hypervisor */
+	/* sdma/ih doorbell range are programed by hypervisor */
 	if (!amdgpu_sriov_vf(adev)) {
 		for (i = 0; i < adev->sdma.num_instances; i++) {
+			ring = &adev->sdma.instance[i].ring;
 			adev->nbio.funcs->sdma_doorbell_range(adev, i,
-				true, adev->doorbell_index.sdma_engine[i] << 1,
+				ring->use_doorbell, ring->doorbell_index,
 				adev->doorbell_index.sdma_doorbell_range);
 		}
+
+		adev->nbio.funcs->ih_doorbell_range(adev, adev->irq.ih.use_doorbell,
+						adev->irq.ih.doorbell_index);
 	}
 }
 
@@ -1451,11 +1456,10 @@ static int soc15_common_hw_init(void *handle)
 	soc15_enable_doorbell_aperture(adev, true);
 	/* HW doorbell routing policy: doorbell writing not
 	 * in SDMA/IH/MM/ACV range will be routed to CP. So
-	 * we need to init SDMA doorbell range prior
-	 * to CP ip block init and ring test.  IH already
-	 * happens before CP.
+	 * we need to init SDMA/IH/MM/ACV doorbell range prior
+	 * to CP ip block init and ring test.
 	 */
-	soc15_sdma_doorbell_range_init(adev);
+	soc15_doorbell_range_init(adev);
 
 	return 0;
 }

@@ -7356,7 +7356,6 @@ static int mvpp2_get_sram(struct platform_device *pdev,
 			  struct mvpp2 *priv)
 {
 	struct resource *res;
-	void __iomem *base;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
 	if (!res) {
@@ -7367,12 +7366,9 @@ static int mvpp2_get_sram(struct platform_device *pdev,
 		return 0;
 	}
 
-	base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(base))
-		return PTR_ERR(base);
+	priv->cm3_base = devm_ioremap_resource(&pdev->dev, res);
 
-	priv->cm3_base = base;
-	return 0;
+	return PTR_ERR_OR_ZERO(priv->cm3_base);
 }
 
 static int mvpp2_probe(struct platform_device *pdev)
@@ -7714,18 +7710,7 @@ static struct platform_driver mvpp2_driver = {
 	},
 };
 
-static int __init mvpp2_driver_init(void)
-{
-	return platform_driver_register(&mvpp2_driver);
-}
-module_init(mvpp2_driver_init);
-
-static void __exit mvpp2_driver_exit(void)
-{
-	platform_driver_unregister(&mvpp2_driver);
-	mvpp2_dbgfs_exit();
-}
-module_exit(mvpp2_driver_exit);
+module_platform_driver(mvpp2_driver);
 
 MODULE_DESCRIPTION("Marvell PPv2 Ethernet Driver - www.marvell.com");
 MODULE_AUTHOR("Marcin Wojtas <mw@semihalf.com>");

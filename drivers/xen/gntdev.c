@@ -35,7 +35,6 @@
 #include <linux/slab.h>
 #include <linux/highmem.h>
 #include <linux/refcount.h>
-#include <linux/workqueue.h>
 
 #include <xen/xen.h>
 #include <xen/grant_table.h>
@@ -61,11 +60,10 @@ module_param(limit, uint, 0644);
 MODULE_PARM_DESC(limit,
 	"Maximum number of grants that may be mapped by one mapping request");
 
-/* True in PV mode, false otherwise */
 static int use_ptemod;
 
-static void unmap_grant_pages(struct gntdev_grant_map *map,
-			      int offset, int pages);
+static int unmap_grant_pages(struct gntdev_grant_map *map,
+			     int offset, int pages);
 
 static struct miscdevice gntdev_miscdev;
 
@@ -122,7 +120,6 @@ static void gntdev_free_map(struct gntdev_grant_map *map)
 	kvfree(map->unmap_ops);
 	kvfree(map->kmap_ops);
 	kvfree(map->kunmap_ops);
-	kvfree(map->being_removed);
 	kfree(map);
 }
 
@@ -143,13 +140,10 @@ struct gntdev_grant_map *gntdev_alloc_map(struct gntdev_priv *priv, int count,
 	add->unmap_ops = kvmalloc_array(count, sizeof(add->unmap_ops[0]),
 					GFP_KERNEL);
 	add->pages     = kvcalloc(count, sizeof(add->pages[0]), GFP_KERNEL);
-	add->being_removed =
-		kvcalloc(count, sizeof(add->being_removed[0]), GFP_KERNEL);
 	if (NULL == add->grants    ||
 	    NULL == add->map_ops   ||
 	    NULL == add->unmap_ops ||
-	    NULL == add->pages     ||
-	    NULL == add->being_removed)
+	    NULL == add->pages)
 		goto err;
 	if (use_ptemod) {
 		add->kmap_ops   = kvmalloc_array(count, sizeof(add->kmap_ops[0]),
@@ -256,38 +250,8 @@ void gntdev_put_map(struct gntdev_priv *priv, struct gntdev_grant_map *map)
 	if (!refcount_dec_and_test(&map->users))
 		return;
 
-	if (map->pages && !use_ptemod) {
-		/*
-		 * Increment the reference count.  This ensures that the
-		 * subsequent call to unmap_grant_pages() will not wind up
-		 * re-entering itself.  It *can* wind up calling
-		 * gntdev_put_map() recursively, but such calls will be with a
-		 * reference count greater than 1, so they will return before
-		 * this code is reached.  The recursion depth is thus limited to
-		 * 1.  Do NOT use refcount_inc() here, as it will detect that
-		 * the reference count is zero and WARN().
-		 */
-		refcount_set(&map->users, 1);
-
-		/*
-		 * Unmap the grants.  This may or may not be asynchronous, so it
-		 * is possible that the reference count is 1 on return, but it
-		 * could also be greater than 1.
-		 */
+	if (map->pages && !use_ptemod)
 		unmap_grant_pages(map, 0, map->count);
-
-		/* Check if the memory now needs to be freed */
-		if (!refcount_dec_and_test(&map->users))
-			return;
-
-		/*
-		 * All pages have been returned to the hypervisor, so free the
-		 * map.
-		 */
-	}
-
-	if (use_ptemod && map->notifier_init)
-		mmu_interval_notifier_remove(&map->notifier);
 
 	if (map->notify.flags & UNMAP_NOTIFY_SEND_EVENT) {
 		notify_remote_via_evtchn(map->notify.event);
@@ -301,7 +265,7 @@ void gntdev_put_map(struct gntdev_priv *priv, struct gntdev_grant_map *map)
 static int find_grant_ptes(pte_t *pte, unsigned long addr, void *data)
 {
 	struct gntdev_grant_map *map = data;
-	unsigned int pgnr = (addr - map->pages_vm_start) >> PAGE_SHIFT;
+	unsigned int pgnr = (addr - map->vma->vm_start) >> PAGE_SHIFT;
 	int flags = map->flags | GNTMAP_application_map | GNTMAP_contains_pte |
 		    (1 << _GNTMAP_guest_avail0);
 	u64 pte_maddr;
@@ -319,7 +283,6 @@ static int find_grant_ptes(pte_t *pte, unsigned long addr, void *data)
 
 int gntdev_map_grant_pages(struct gntdev_grant_map *map)
 {
-	size_t alloced = 0;
 	int i, err = 0;
 
 	if (!use_ptemod) {
@@ -368,130 +331,97 @@ int gntdev_map_grant_pages(struct gntdev_grant_map *map)
 			map->count);
 
 	for (i = 0; i < map->count; i++) {
-		if (map->map_ops[i].status == GNTST_okay) {
+		if (map->map_ops[i].status == GNTST_okay)
 			map->unmap_ops[i].handle = map->map_ops[i].handle;
-			alloced++;
-		} else if (!err)
+		else if (!err)
 			err = -EINVAL;
 
 		if (map->flags & GNTMAP_device_map)
 			map->unmap_ops[i].dev_bus_addr = map->map_ops[i].dev_bus_addr;
 
 		if (use_ptemod) {
-			if (map->kmap_ops[i].status == GNTST_okay) {
-				alloced++;
+			if (map->kmap_ops[i].status == GNTST_okay)
 				map->kunmap_ops[i].handle = map->kmap_ops[i].handle;
-			} else if (!err)
+			else if (!err)
 				err = -EINVAL;
 		}
 	}
-	atomic_add(alloced, &map->live_grants);
 	return err;
 }
 
-static void __unmap_grant_pages_done(int result,
-		struct gntab_unmap_queue_data *data)
+static int __unmap_grant_pages(struct gntdev_grant_map *map, int offset,
+			       int pages)
 {
-	unsigned int i;
-	struct gntdev_grant_map *map = data->data;
-	unsigned int offset = data->unmap_ops - map->unmap_ops;
-	int successful_unmaps = 0;
-	int live_grants;
+	int i, err = 0;
+	struct gntab_unmap_queue_data unmap_data;
 
-	for (i = 0; i < data->count; i++) {
-		if (map->unmap_ops[offset + i].status == GNTST_okay &&
-		    map->unmap_ops[offset + i].handle != INVALID_GRANT_HANDLE)
-			successful_unmaps++;
+	if (map->notify.flags & UNMAP_NOTIFY_CLEAR_BYTE) {
+		int pgno = (map->notify.addr >> PAGE_SHIFT);
+		if (pgno >= offset && pgno < offset + pages) {
+			/* No need for kmap, pages are in lowmem */
+			uint8_t *tmp = pfn_to_kaddr(page_to_pfn(map->pages[pgno]));
+			tmp[map->notify.addr & (PAGE_SIZE-1)] = 0;
+			map->notify.flags &= ~UNMAP_NOTIFY_CLEAR_BYTE;
+		}
+	}
 
-		WARN_ON(map->unmap_ops[offset + i].status != GNTST_okay &&
-			map->unmap_ops[offset + i].handle != INVALID_GRANT_HANDLE);
+	unmap_data.unmap_ops = map->unmap_ops + offset;
+	unmap_data.kunmap_ops = use_ptemod ? map->kunmap_ops + offset : NULL;
+	unmap_data.pages = map->pages + offset;
+	unmap_data.count = pages;
+
+	err = gnttab_unmap_refs_sync(&unmap_data);
+	if (err)
+		return err;
+
+	for (i = 0; i < pages; i++) {
+		if (map->unmap_ops[offset+i].status)
+			err = -EINVAL;
 		pr_debug("unmap handle=%d st=%d\n",
 			map->unmap_ops[offset+i].handle,
 			map->unmap_ops[offset+i].status);
 		map->unmap_ops[offset+i].handle = INVALID_GRANT_HANDLE;
 		if (use_ptemod) {
-			if (map->kunmap_ops[offset + i].status == GNTST_okay &&
-			    map->kunmap_ops[offset + i].handle != INVALID_GRANT_HANDLE)
-				successful_unmaps++;
-
-			WARN_ON(map->kunmap_ops[offset + i].status != GNTST_okay &&
-				map->kunmap_ops[offset + i].handle != INVALID_GRANT_HANDLE);
+			if (map->kunmap_ops[offset+i].status)
+				err = -EINVAL;
 			pr_debug("kunmap handle=%u st=%d\n",
 				 map->kunmap_ops[offset+i].handle,
 				 map->kunmap_ops[offset+i].status);
 			map->kunmap_ops[offset+i].handle = INVALID_GRANT_HANDLE;
 		}
 	}
-
-	/*
-	 * Decrease the live-grant counter.  This must happen after the loop to
-	 * prevent premature reuse of the grants by gnttab_mmap().
-	 */
-	live_grants = atomic_sub_return(successful_unmaps, &map->live_grants);
-	if (WARN_ON(live_grants < 0))
-		pr_err("%s: live_grants became negative (%d) after unmapping %d pages!\n",
-		       __func__, live_grants, successful_unmaps);
-
-	/* Release reference taken by __unmap_grant_pages */
-	gntdev_put_map(NULL, map);
+	return err;
 }
 
-static void __unmap_grant_pages(struct gntdev_grant_map *map, int offset,
-			       int pages)
+static int unmap_grant_pages(struct gntdev_grant_map *map, int offset,
+			     int pages)
 {
-	if (map->notify.flags & UNMAP_NOTIFY_CLEAR_BYTE) {
-		int pgno = (map->notify.addr >> PAGE_SHIFT);
-
-		if (pgno >= offset && pgno < offset + pages) {
-			/* No need for kmap, pages are in lowmem */
-			uint8_t *tmp = pfn_to_kaddr(page_to_pfn(map->pages[pgno]));
-
-			tmp[map->notify.addr & (PAGE_SIZE-1)] = 0;
-			map->notify.flags &= ~UNMAP_NOTIFY_CLEAR_BYTE;
-		}
-	}
-
-	map->unmap_data.unmap_ops = map->unmap_ops + offset;
-	map->unmap_data.kunmap_ops = use_ptemod ? map->kunmap_ops + offset : NULL;
-	map->unmap_data.pages = map->pages + offset;
-	map->unmap_data.count = pages;
-	map->unmap_data.done = __unmap_grant_pages_done;
-	map->unmap_data.data = map;
-	refcount_inc(&map->users); /* to keep map alive during async call below */
-
-	gnttab_unmap_refs_async(&map->unmap_data);
-}
-
-static void unmap_grant_pages(struct gntdev_grant_map *map, int offset,
-			      int pages)
-{
-	int range;
-
-	if (atomic_read(&map->live_grants) == 0)
-		return; /* Nothing to do */
+	int range, err = 0;
 
 	pr_debug("unmap %d+%d [%d+%d]\n", map->index, map->count, offset, pages);
 
 	/* It is possible the requested range will have a "hole" where we
 	 * already unmapped some of the grants. Only unmap valid ranges.
 	 */
-	while (pages) {
-		while (pages && map->being_removed[offset]) {
+	while (pages && !err) {
+		while (pages &&
+		       map->unmap_ops[offset].handle == INVALID_GRANT_HANDLE) {
 			offset++;
 			pages--;
 		}
 		range = 0;
 		while (range < pages) {
-			if (map->being_removed[offset + range])
+			if (map->unmap_ops[offset + range].handle ==
+			    INVALID_GRANT_HANDLE)
 				break;
-			map->being_removed[offset + range] = true;
 			range++;
 		}
-		if (range)
-			__unmap_grant_pages(map, offset, range);
+		err = __unmap_grant_pages(map, offset, range);
 		offset += range;
 		pages -= range;
 	}
+
+	return err;
 }
 
 /* ------------------------------------------------------------------ */
@@ -511,7 +441,11 @@ static void gntdev_vma_close(struct vm_area_struct *vma)
 	struct gntdev_priv *priv = file->private_data;
 
 	pr_debug("gntdev_vma_close %p\n", vma);
-
+	if (use_ptemod) {
+		WARN_ON(map->vma != vma);
+		mmu_interval_notifier_remove(&map->notifier);
+		map->vma = NULL;
+	}
 	vma->vm_private_data = NULL;
 	gntdev_put_map(priv, map);
 }
@@ -539,13 +473,10 @@ static bool gntdev_invalidate(struct mmu_interval_notifier *mn,
 	struct gntdev_grant_map *map =
 		container_of(mn, struct gntdev_grant_map, notifier);
 	unsigned long mstart, mend;
-	unsigned long map_start, map_end;
+	int err;
 
 	if (!mmu_notifier_range_blockable(range))
 		return false;
-
-	map_start = map->pages_vm_start;
-	map_end = map->pages_vm_start + (map->count << PAGE_SHIFT);
 
 	/*
 	 * If the VMA is split or otherwise changed the notifier is not
@@ -553,16 +484,20 @@ static bool gntdev_invalidate(struct mmu_interval_notifier *mn,
 	 * VMA. FIXME: It would be much more understandable to just prevent
 	 * modifying the VMA in the first place.
 	 */
-	if (map_start >= range->end || map_end <= range->start)
+	if (map->vma->vm_start >= range->end ||
+	    map->vma->vm_end <= range->start)
 		return true;
 
-	mstart = max(range->start, map_start);
-	mend = min(range->end, map_end);
+	mstart = max(range->start, map->vma->vm_start);
+	mend = min(range->end, map->vma->vm_end);
 	pr_debug("map %d+%d (%lx %lx), range %lx %lx, mrange %lx %lx\n",
-		 map->index, map->count, map_start, map_end,
-		 range->start, range->end, mstart, mend);
-	unmap_grant_pages(map, (mstart - map_start) >> PAGE_SHIFT,
-			  (mend - mstart) >> PAGE_SHIFT);
+			map->index, map->count,
+			map->vma->vm_start, map->vma->vm_end,
+			range->start, range->end, mstart, mend);
+	err = unmap_grant_pages(map,
+				(mstart - map->vma->vm_start) >> PAGE_SHIFT,
+				(mend - mstart) >> PAGE_SHIFT);
+	WARN_ON(err);
 
 	return true;
 }
@@ -1042,15 +977,14 @@ static int gntdev_mmap(struct file *flip, struct vm_area_struct *vma)
 		return -EINVAL;
 
 	pr_debug("map %d+%d at %lx (pgoff %lx)\n",
-		 index, count, vma->vm_start, vma->vm_pgoff);
+			index, count, vma->vm_start, vma->vm_pgoff);
 
 	mutex_lock(&priv->lock);
 	map = gntdev_find_map_index(priv, index, count);
 	if (!map)
 		goto unlock_out;
-	if (!atomic_add_unless(&map->in_use, 1, 1))
+	if (use_ptemod && map->vma)
 		goto unlock_out;
-
 	refcount_inc(&map->users);
 
 	vma->vm_ops = &gntdev_vmops;
@@ -1071,16 +1005,15 @@ static int gntdev_mmap(struct file *flip, struct vm_area_struct *vma)
 			map->flags |= GNTMAP_readonly;
 	}
 
-	map->pages_vm_start = vma->vm_start;
-
 	if (use_ptemod) {
+		map->vma = vma;
 		err = mmu_interval_notifier_insert_locked(
 			&map->notifier, vma->vm_mm, vma->vm_start,
 			vma->vm_end - vma->vm_start, &gntdev_mmu_ops);
-		if (err)
+		if (err) {
+			map->vma = NULL;
 			goto out_unlock_put;
-
-		map->notifier_init = true;
+		}
 	}
 	mutex_unlock(&priv->lock);
 
@@ -1097,6 +1030,7 @@ static int gntdev_mmap(struct file *flip, struct vm_area_struct *vma)
 		 */
 		mmu_interval_read_begin(&map->notifier);
 
+		map->pages_vm_start = vma->vm_start;
 		err = apply_to_page_range(vma->vm_mm, vma->vm_start,
 					  vma->vm_end - vma->vm_start,
 					  find_grant_ptes, map);
@@ -1125,8 +1059,13 @@ unlock_out:
 out_unlock_put:
 	mutex_unlock(&priv->lock);
 out_put_map:
-	if (use_ptemod)
+	if (use_ptemod) {
 		unmap_grant_pages(map, 0, map->count);
+		if (map->vma) {
+			mmu_interval_notifier_remove(&map->notifier);
+			map->vma = NULL;
+		}
+	}
 	gntdev_put_map(priv, map);
 	return err;
 }

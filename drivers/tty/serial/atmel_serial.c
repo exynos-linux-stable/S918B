@@ -295,16 +295,20 @@ static int atmel_config_rs485(struct uart_port *port,
 
 	mode = atmel_uart_readl(port, ATMEL_US_MR);
 
+	/* Resetting serial mode to RS232 (0x0) */
+	mode &= ~ATMEL_US_USMODE;
+
+	port->rs485 = *rs485conf;
+
 	if (rs485conf->flags & SER_RS485_ENABLED) {
 		dev_dbg(port->dev, "Setting UART to RS485\n");
-		if (rs485conf->flags & SER_RS485_RX_DURING_TX)
+		if (port->rs485.flags & SER_RS485_RX_DURING_TX)
 			atmel_port->tx_done_mask = ATMEL_US_TXRDY;
 		else
 			atmel_port->tx_done_mask = ATMEL_US_TXEMPTY;
 
 		atmel_uart_writel(port, ATMEL_US_TTGR,
 				  rs485conf->delay_rts_after_send);
-		mode &= ~ATMEL_US_USMODE;
 		mode |= ATMEL_US_USMODE_RS485;
 	} else {
 		dev_dbg(port->dev, "Setting UART to RS232\n");
@@ -2615,7 +2619,13 @@ static void __init atmel_console_get_options(struct uart_port *port, int *baud,
 	else if (mr == ATMEL_US_PAR_ODD)
 		*parity = 'o';
 
-	*baud = port->uartclk / (16 * quot);
+	/*
+	 * The serial core only rounds down when matching this to a
+	 * supported baud rate. Make sure we don't end up slightly
+	 * lower than one of those, as it would make us fall through
+	 * to a much lower baud rate than we really want.
+	 */
+	*baud = port->uartclk / (16 * (quot - 1));
 }
 
 static int __init atmel_console_setup(struct console *co, char *options)

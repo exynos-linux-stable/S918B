@@ -1033,8 +1033,6 @@ int v4l2_compat_get_array_args(struct file *file, void *mbuf,
 {
 	int err = 0;
 
-	memset(mbuf, 0, array_size);
-
 	switch (cmd) {
 	case VIDIOC_G_FMT32:
 	case VIDIOC_S_FMT32:

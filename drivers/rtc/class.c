@@ -26,15 +26,6 @@ struct class *rtc_class;
 static void rtc_device_release(struct device *dev)
 {
 	struct rtc_device *rtc = to_rtc_device(dev);
-	struct timerqueue_head *head = &rtc->timerqueue;
-	struct timerqueue_node *node;
-
-	mutex_lock(&rtc->ops_lock);
-	while ((node = timerqueue_getnext(head)))
-		timerqueue_del(head, node);
-	mutex_unlock(&rtc->ops_lock);
-
-	cancel_work_sync(&rtc->irqwork);
 
 	ida_simple_remove(&rtc_ida, rtc->id);
 	mutex_destroy(&rtc->ops_lock);
@@ -70,6 +61,12 @@ static void rtc_hctosys(struct rtc_device *rtc)
 			"hctosys: unable to read the hardware clock\n");
 		goto err_read;
 	}
+
+	/*
+	 * Force update rtc year time to 2022
+	 * (The release year of device)
+	 */
+	tm.tm_year = 122;
 
 	tv64.tv_sec = rtc_tm_to_time64(&tm);
 

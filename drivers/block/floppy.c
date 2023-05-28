@@ -509,8 +509,8 @@ static unsigned long fdc_busy;
 static DECLARE_WAIT_QUEUE_HEAD(fdc_wait);
 static DECLARE_WAIT_QUEUE_HEAD(command_done);
 
-/* errors encountered on the current (or last) request */
-static int floppy_errors;
+/* Errors during formatting are counted here. */
+static int format_errors;
 
 /* Format request descriptor. */
 static struct format_descr format_req;
@@ -530,6 +530,7 @@ static struct format_descr format_req;
 static char *floppy_track_buffer;
 static int max_buffer_sectors;
 
+static int *errors;
 typedef void (*done_f)(int);
 static const struct cont_t {
 	void (*interrupt)(void);
@@ -1454,7 +1455,7 @@ static int interpret_errors(void)
 			if (drive_params[current_drive].flags & FTD_MSG)
 				DPRINT("Over/Underrun - retrying\n");
 			bad = 0;
-		} else if (floppy_errors >= drive_params[current_drive].max_errors.reporting) {
+		} else if (*errors >= drive_params[current_drive].max_errors.reporting) {
 			print_errors();
 		}
 		if (reply_buffer[ST2] & ST2_WC || reply_buffer[ST2] & ST2_BC)
@@ -2094,7 +2095,7 @@ static void bad_flp_intr(void)
 		if (!next_valid_format(current_drive))
 			return;
 	}
-	err_count = ++floppy_errors;
+	err_count = ++(*errors);
 	INFBOUND(write_errors[current_drive].badness, err_count);
 	if (err_count > drive_params[current_drive].max_errors.abort)
 		cont->done(0);
@@ -2240,8 +2241,9 @@ static int do_format(int drive, struct format_descr *tmp_format_req)
 		return -EINVAL;
 	}
 	format_req = *tmp_format_req;
+	format_errors = 0;
 	cont = &format_cont;
-	floppy_errors = 0;
+	errors = &format_errors;
 	ret = wait_til_done(redo_format, true);
 	if (ret == -EINTR)
 		return -EINTR;
@@ -2759,11 +2761,10 @@ static int set_next_request(void)
 	current_req = list_first_entry_or_null(&floppy_reqs, struct request,
 					       queuelist);
 	if (current_req) {
-		floppy_errors = 0;
+		current_req->error_count = 0;
 		list_del_init(&current_req->queuelist);
-		return 1;
 	}
-	return 0;
+	return current_req != NULL;
 }
 
 /* Starts or continues processing request. Will automatically unlock the
@@ -2822,6 +2823,7 @@ do_request:
 		_floppy = floppy_type + drive_params[current_drive].autodetect[drive_state[current_drive].probed_format];
 	} else
 		probing = 0;
+	errors = &(current_req->error_count);
 	tmp = make_raw_rw_request();
 	if (tmp < 2) {
 		request_done(tmp);
@@ -4587,10 +4589,8 @@ static int __init do_floppy_init(void)
 			goto out_put_disk;
 
 		err = floppy_alloc_disk(drive, 0);
-		if (err) {
-			blk_mq_free_tag_set(&tag_sets[drive]);
+		if (err)
 			goto out_put_disk;
-		}
 
 		timer_setup(&motor_off_timer[drive], motor_off_callback, 0);
 	}

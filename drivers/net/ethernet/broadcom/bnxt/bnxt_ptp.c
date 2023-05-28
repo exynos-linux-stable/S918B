@@ -61,23 +61,14 @@ static int bnxt_refclk_read(struct bnxt *bp, struct ptp_system_timestamp *sts,
 			    u64 *ns)
 {
 	struct bnxt_ptp_cfg *ptp = bp->ptp_cfg;
-	u32 high_before, high_now, low;
 
 	if (test_bit(BNXT_STATE_IN_FW_RESET, &bp->state))
 		return -EIO;
 
-	high_before = readl(bp->bar0 + ptp->refclk_mapped_regs[1]);
 	ptp_read_system_prets(sts);
-	low = readl(bp->bar0 + ptp->refclk_mapped_regs[0]);
+	*ns = readl(bp->bar0 + ptp->refclk_mapped_regs[0]);
 	ptp_read_system_postts(sts);
-	high_now = readl(bp->bar0 + ptp->refclk_mapped_regs[1]);
-	if (high_now != high_before) {
-		ptp_read_system_prets(sts);
-		low = readl(bp->bar0 + ptp->refclk_mapped_regs[0]);
-		ptp_read_system_postts(sts);
-	}
-	*ns = ((u64)high_now << 32) | low;
-
+	*ns |= (u64)readl(bp->bar0 + ptp->refclk_mapped_regs[1]) << 32;
 	return 0;
 }
 

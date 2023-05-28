@@ -799,7 +799,11 @@ static int ax88772_stop(struct usbnet *dev)
 {
 	struct asix_common_private *priv = dev->driver_priv;
 
-	phy_stop(priv->phydev);
+	/* On unplugged USB, we will get MDIO communication errors and the
+	 * PHY will be set in to PHY_HALTED state.
+	 */
+	if (priv->phydev->state != PHY_HALTED)
+		phy_stop(priv->phydev);
 
 	return 0;
 }

@@ -93,8 +93,7 @@ static inline struct anon_vma *anon_vma_alloc(void)
 	anon_vma = kmem_cache_alloc(anon_vma_cachep, GFP_KERNEL);
 	if (anon_vma) {
 		atomic_set(&anon_vma->refcount, 1);
-		anon_vma->num_children = 0;
-		anon_vma->num_active_vmas = 0;
+		anon_vma->degree = 1;	/* Reference for first vma */
 		anon_vma->parent = anon_vma;
 		/*
 		 * Initialise the anon_vma root to point to itself. If called
@@ -202,7 +201,6 @@ int __anon_vma_prepare(struct vm_area_struct *vma)
 		anon_vma = anon_vma_alloc();
 		if (unlikely(!anon_vma))
 			goto out_enomem_free_avc;
-		anon_vma->num_children++; /* self-parent link for new root */
 		allocated = anon_vma;
 	}
 
@@ -212,7 +210,8 @@ int __anon_vma_prepare(struct vm_area_struct *vma)
 	if (likely(!vma->anon_vma)) {
 		vma->anon_vma = anon_vma;
 		anon_vma_chain_link(vma, avc, anon_vma);
-		anon_vma->num_active_vmas++;
+		/* vma reference or self-parent link for new root */
+		anon_vma->degree++;
 		allocated = NULL;
 		avc = NULL;
 	}
@@ -297,19 +296,19 @@ int anon_vma_clone(struct vm_area_struct *dst, struct vm_area_struct *src)
 		anon_vma_chain_link(dst, avc, anon_vma);
 
 		/*
-		 * Reuse existing anon_vma if it has no vma and only one
-		 * anon_vma child.
+		 * Reuse existing anon_vma if its degree lower than two,
+		 * that means it has no vma and only one anon_vma child.
 		 *
-		 * Root anon_vma is never reused:
+		 * Do not chose parent anon_vma, otherwise first child
+		 * will always reuse it. Root anon_vma is never reused:
 		 * it has self-parent reference and at least one child.
 		 */
 		if (!dst->anon_vma && src->anon_vma &&
-		    anon_vma->num_children < 2 &&
-		    anon_vma->num_active_vmas == 0)
+		    anon_vma != src->anon_vma && anon_vma->degree < 2)
 			dst->anon_vma = anon_vma;
 	}
 	if (dst->anon_vma)
-		dst->anon_vma->num_active_vmas++;
+		dst->anon_vma->degree++;
 	unlock_anon_vma_root(root);
 	return 0;
 
@@ -359,7 +358,6 @@ int anon_vma_fork(struct vm_area_struct *vma, struct vm_area_struct *pvma)
 	anon_vma = anon_vma_alloc();
 	if (!anon_vma)
 		goto out_error;
-	anon_vma->num_active_vmas++;
 	avc = anon_vma_chain_alloc(GFP_KERNEL);
 	if (!avc)
 		goto out_error_free_anon_vma;
@@ -380,7 +378,7 @@ int anon_vma_fork(struct vm_area_struct *vma, struct vm_area_struct *pvma)
 	vma->anon_vma = anon_vma;
 	anon_vma_lock_write(anon_vma);
 	anon_vma_chain_link(vma, avc, anon_vma);
-	anon_vma->parent->num_children++;
+	anon_vma->parent->degree++;
 	anon_vma_unlock_write(anon_vma);
 
 	return 0;
@@ -412,7 +410,7 @@ void unlink_anon_vmas(struct vm_area_struct *vma)
 		 * to free them outside the lock.
 		 */
 		if (RB_EMPTY_ROOT(&anon_vma->rb_root.rb_root)) {
-			anon_vma->parent->num_children--;
+			anon_vma->parent->degree--;
 			continue;
 		}
 
@@ -420,7 +418,7 @@ void unlink_anon_vmas(struct vm_area_struct *vma)
 		anon_vma_chain_free(avc);
 	}
 	if (vma->anon_vma) {
-		vma->anon_vma->num_active_vmas--;
+		vma->anon_vma->degree--;
 
 #ifndef CONFIG_SPECULATIVE_PAGE_FAULT
 		/*
@@ -440,8 +438,7 @@ void unlink_anon_vmas(struct vm_area_struct *vma)
 	list_for_each_entry_safe(avc, next, &vma->anon_vma_chain, same_vma) {
 		struct anon_vma *anon_vma = avc->anon_vma;
 
-		VM_WARN_ON(anon_vma->num_children);
-		VM_WARN_ON(anon_vma->num_active_vmas);
+		VM_WARN_ON(anon_vma->degree);
 		put_anon_vma(anon_vma);
 
 		list_del(&avc->same_vma);
@@ -532,16 +529,13 @@ out:
  *
  * Its a little more complex as it tries to keep the fast path to a single
  * atomic op -- the trylock. If we fail the trylock, we fall back to getting a
- * reference like with page_get_anon_vma() and then block on the mutex
- * on !rwc->try_lock case.
+ * reference like with page_get_anon_vma() and then block on the mutex.
  */
-struct anon_vma *page_lock_anon_vma_read(struct page *page,
-					 struct rmap_walk_control *rwc)
+struct anon_vma *page_lock_anon_vma_read(struct page *page)
 {
 	struct anon_vma *anon_vma = NULL;
 	struct anon_vma *root_anon_vma;
 	unsigned long anon_mapping;
-	bool success = false;
 
 	rcu_read_lock();
 	anon_mapping = (unsigned long)READ_ONCE(page->mapping);
@@ -562,17 +556,6 @@ struct anon_vma *page_lock_anon_vma_read(struct page *page,
 			up_read(&root_anon_vma->rwsem);
 			anon_vma = NULL;
 		}
-		goto out;
-	}
-	trace_android_vh_do_page_trylock(page, NULL, NULL, &success);
-	if (success) {
-		anon_vma = NULL;
-		goto out;
-	}
-
-	if (rwc && rwc->try_lock) {
-		anon_vma = NULL;
-		rwc->contended = true;
 		goto out;
 	}
 
@@ -877,10 +860,8 @@ static bool invalid_page_referenced_vma(struct vm_area_struct *vma, void *arg)
  * @memcg: target memory cgroup
  * @vm_flags: collect encountered vma->vm_flags who actually referenced the page
  *
- * Quick test_and_clear_referenced for all mappings of a page,
- *
- * Return: The number of mappings which referenced the page. Return -1 if
- * the function bailed out due to rmap lock contention.
+ * Quick test_and_clear_referenced for all mappings to a page,
+ * returns the number of ptes which referenced the page.
  */
 int page_referenced(struct page *page,
 		    int is_locked,
@@ -896,7 +877,6 @@ int page_referenced(struct page *page,
 		.rmap_one = page_referenced_one,
 		.arg = (void *)&pra,
 		.anon_lock = page_lock_anon_vma_read,
-		.try_lock = true,
 	};
 
 	*vm_flags = 0;
@@ -921,13 +901,27 @@ int page_referenced(struct page *page,
 		rwc.invalid_vma = invalid_page_referenced_vma;
 	}
 
-	rmap_walk(page, &rwc);
+	if (need_memory_boosting() && !PageAnon(page)) {
+		struct address_space *mapping = page_mapping(page);
+
+		if (mapping != NULL) {
+			if (i_mmap_trylock_read(mapping)) {
+				rmap_walk_locked(page, &rwc);
+				i_mmap_unlock_read(mapping);
+			} else {
+				pra.referenced = 1;
+			}
+		}
+	} else {
+		rmap_walk(page, &rwc);
+	}
+
 	*vm_flags = pra.vm_flags;
 
 	if (we_locked)
 		unlock_page(page);
 
-	return rwc.contended ? -1 : pra.referenced;
+	return pra.referenced;
 }
 
 static bool page_mkclean_one(struct page *page, struct vm_area_struct *vma,
@@ -1788,6 +1782,8 @@ void try_to_unmap(struct page *page, enum ttu_flags flags)
 
 	if (flags & TTU_RMAP_LOCKED)
 		rmap_walk_locked(page, &rwc);
+	else if (flags & TTU_RMAP_TRY_LOCK)
+		rmap_walk_trylock(page, &rwc);
 	else
 		rmap_walk(page, &rwc);
 }
@@ -2342,7 +2338,7 @@ static struct anon_vma *rmap_walk_anon_lock(struct page *page,
 	struct anon_vma *anon_vma;
 
 	if (rwc->anon_lock)
-		return rwc->anon_lock(page, rwc);
+		return rwc->anon_lock(page);
 
 	/*
 	 * Note: remove_migration_ptes() cannot use page_lock_anon_vma_read()
@@ -2354,17 +2350,7 @@ static struct anon_vma *rmap_walk_anon_lock(struct page *page,
 	if (!anon_vma)
 		return NULL;
 
-	if (anon_vma_trylock_read(anon_vma))
-		goto out;
-
-	if (rwc->try_lock) {
-		anon_vma = NULL;
-		rwc->contended = true;
-		goto out;
-	}
-
 	anon_vma_lock_read(anon_vma);
-out:
 	return anon_vma;
 }
 
@@ -2436,12 +2422,11 @@ static void rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc,
  * LOCKED.
  */
 static void rmap_walk_file(struct page *page, struct rmap_walk_control *rwc,
-		bool locked)
+		bool locked, bool trylock)
 {
 	struct address_space *mapping = page_mapping(page);
 	pgoff_t pgoff_start, pgoff_end;
 	struct vm_area_struct *vma;
-	bool got_lock = false, success = false;
 
 	/*
 	 * The page lock not only makes sure that page->mapping cannot
@@ -2456,25 +2441,15 @@ static void rmap_walk_file(struct page *page, struct rmap_walk_control *rwc,
 
 	pgoff_start = page_to_pgoff(page);
 	pgoff_end = pgoff_start + thp_nr_pages(page) - 1;
+
 	if (!locked) {
-		trace_android_vh_do_page_trylock(page,
-					&mapping->i_mmap_rwsem, &got_lock, &success);
-		if (success) {
-			if (!got_lock)
+		if (trylock) {
+			if (!i_mmap_trylock_read(mapping))
 				return;
 		} else {
-			if (i_mmap_trylock_read(mapping))
-				goto lookup;
-
-			if (rwc->try_lock) {
-				rwc->contended = true;
-				return;
-			}
-
 			i_mmap_lock_read(mapping);
 		}
 	}
-lookup:
 	vma_interval_tree_foreach(vma, &mapping->i_mmap,
 			pgoff_start, pgoff_end) {
 		unsigned long address = vma_address(page, vma);
@@ -2503,7 +2478,17 @@ void rmap_walk(struct page *page, struct rmap_walk_control *rwc)
 	else if (PageAnon(page))
 		rmap_walk_anon(page, rwc, false);
 	else
-		rmap_walk_file(page, rwc, false);
+		rmap_walk_file(page, rwc, false, false);
+}
+
+void rmap_walk_trylock(struct page *page, struct rmap_walk_control *rwc)
+{
+	if (unlikely(PageKsm(page)))
+		rmap_walk_ksm(page, rwc);
+	else if (PageAnon(page))
+		rmap_walk_anon(page, rwc, false);
+	else
+		rmap_walk_file(page, rwc, false, true);
 }
 
 /* Like rmap_walk, but caller holds relevant rmap lock */
@@ -2514,7 +2499,7 @@ void rmap_walk_locked(struct page *page, struct rmap_walk_control *rwc)
 	if (PageAnon(page))
 		rmap_walk_anon(page, rwc, true);
 	else
-		rmap_walk_file(page, rwc, true);
+		rmap_walk_file(page, rwc, true, false);
 }
 
 #ifdef CONFIG_HUGETLB_PAGE

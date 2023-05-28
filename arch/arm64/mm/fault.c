@@ -319,7 +319,7 @@ static void die_kernel_fault(const char *msg, unsigned long addr,
 	show_pte(addr);
 	die("Oops", regs, esr);
 	bust_spinlocks(0);
-	make_task_dead(SIGKILL);
+	do_exit(SIGKILL);
 }
 
 #ifdef CONFIG_KASAN_HW_TAGS
@@ -543,7 +543,6 @@ static int __kprobes do_page_fault(unsigned long far, unsigned int esr,
 	unsigned long addr = untagged_addr(far);
 #ifdef CONFIG_SPECULATIVE_PAGE_FAULT
 	struct vm_area_struct *vma;
-	struct vm_area_struct pvma;
 	unsigned long seq;
 #endif
 
@@ -627,17 +626,17 @@ static int __kprobes do_page_fault(unsigned long far, unsigned int esr,
 		count_vm_spf_event(SPF_ABORT_NO_SPECULATE);
 		goto spf_abort;
 	}
-	pvma = *vma;
+
 	if (!mmap_seq_read_check(mm, seq, SPF_ABORT_VMA_COPY)) {
 		put_vma(vma);
 		goto spf_abort;
 	}
-	if (!(pvma.vm_flags & vm_flags)) {
+	if (!(vma->vm_flags & vm_flags)) {
 		put_vma(vma);
 		count_vm_spf_event(SPF_ABORT_ACCESS_ERROR);
 		goto spf_abort;
 	}
-	fault = do_handle_mm_fault(&pvma, addr & PAGE_MASK,
+	fault = do_handle_mm_fault(vma, addr & PAGE_MASK,
 			mm_flags | FAULT_FLAG_SPECULATIVE, seq, regs);
 	put_vma(vma);
 
@@ -792,7 +791,10 @@ static int do_sea(unsigned long far, unsigned int esr, struct pt_regs *regs)
 	unsigned long siaddr;
 
 	inf = esr_to_fault_info(esr);
-
+	
+	if(user_mode(regs))
+		panic("do_sea");
+		
 	if (user_mode(regs) && apei_claim_sea(regs) == 0) {
 		/*
 		 * APEI claimed this as a firmware-first notification.

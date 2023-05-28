@@ -529,7 +529,6 @@ static void dsa_tag_8021q_teardown(struct dsa_switch *ds)
 int dsa_tag_8021q_register(struct dsa_switch *ds, __be16 proto)
 {
 	struct dsa_8021q_context *ctx;
-	int err;
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
@@ -542,15 +541,7 @@ int dsa_tag_8021q_register(struct dsa_switch *ds, __be16 proto)
 
 	ds->tag_8021q_ctx = ctx;
 
-	err = dsa_tag_8021q_setup(ds);
-	if (err)
-		goto err_free;
-
-	return 0;
-
-err_free:
-	kfree(ctx);
-	return err;
+	return dsa_tag_8021q_setup(ds);
 }
 EXPORT_SYMBOL_GPL(dsa_tag_8021q_register);
 

@@ -1133,8 +1133,10 @@ static int snd_usbmidi_output_open(struct snd_rawmidi_substream *substream)
 					port = &umidi->endpoints[i].out->ports[j];
 					break;
 				}
-	if (!port)
+	if (!port) {
+		snd_BUG();
 		return -ENXIO;
+	}
 
 	substream->runtime->private_data = port;
 	port->state = STATE_UNKNOWN;
@@ -1143,9 +1145,6 @@ static int snd_usbmidi_output_open(struct snd_rawmidi_substream *substream)
 
 static int snd_usbmidi_output_close(struct snd_rawmidi_substream *substream)
 {
-	struct usbmidi_out_port *port = substream->runtime->private_data;
-
-	cancel_work_sync(&port->ep->work);
 	return substream_open(substream, 0, 0);
 }
 

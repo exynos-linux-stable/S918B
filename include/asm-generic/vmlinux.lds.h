@@ -337,7 +337,6 @@
 #define DATA_DATA							\
 	*(.xiptext)							\
 	*(DATA_MAIN)							\
-	*(.data..decrypted)						\
 	*(.ref.data)							\
 	*(.data..shared_aligned) /* percpu related */			\
 	MEM_KEEP(init.data*)						\
@@ -422,6 +421,22 @@
 	__end_ro_after_init = .;
 #endif
 
+#ifdef CONFIG_UH
+#define UH_RO_SECTION						\
+	. = ALIGN(4096);						\
+	.uh_bss       : AT(ADDR(.uh_bss) - LOAD_OFFSET) {	\
+		*(.uh_bss.page_aligned)				\
+		*(.uh_bss)						\
+	} = 0								\
+									\
+	.uh_ro        : AT(ADDR(.uh_ro) - LOAD_OFFSET) {	\
+		*(.rkp_ro)						\
+		*(.kdp_ro)						\
+	}
+#else
+#define UH_RO_SECTION
+#endif
+
 /*
  * Read only Data
  */
@@ -442,6 +457,9 @@
 	.rodata1          : AT(ADDR(.rodata1) - LOAD_OFFSET) {		\
 		*(.rodata1)						\
 	}								\
+									\
+	/* uH */					\
+	UH_RO_SECTION				\
 									\
 	/* PCI quirks */						\
 	.pci_fixup        : AT(ADDR(.pci_fixup) - LOAD_OFFSET) {	\
@@ -550,9 +568,10 @@
  */
 #ifdef CONFIG_CFI_CLANG
 #define TEXT_CFI_JT							\
-		ALIGN_FUNCTION();					\
+		. = ALIGN(PMD_SIZE);					\
 		__cfi_jt_start = .;					\
 		*(.text..L.cfi.jumptable .text..L.cfi.jumptable.*)	\
+		. = ALIGN(PMD_SIZE);					\
 		__cfi_jt_end = .;
 #else
 #define TEXT_CFI_JT
@@ -726,8 +745,7 @@
 	DTPM_TABLE()							\
 	EARLYCON_TABLE()						\
 	LSM_TABLE()							\
-	EARLY_LSM_TABLE()						\
-	KUNIT_TABLE()
+	EARLY_LSM_TABLE()
 
 #define INIT_TEXT							\
 	*(.init.text .init.text.*)					\
@@ -970,6 +988,7 @@
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 #define PERCPU_DECRYPTED_SECTION					\
 	. = ALIGN(PAGE_SIZE);						\
+	*(.data..decrypted)						\
 	*(.data..percpu..decrypted)					\
 	. = ALIGN(PAGE_SIZE);
 #else
@@ -1150,6 +1169,7 @@
 		INIT_CALLS						\
 		CON_INITCALL						\
 		INIT_RAM_FS						\
+		KUNIT_TABLE()						\
 	}
 
 #define BSS_SECTION(sbss_align, bss_align, stop_align)			\

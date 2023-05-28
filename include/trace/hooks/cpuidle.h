@@ -9,11 +9,8 @@
 
 #include <trace/hooks/vendor_hooks.h>
 
-#ifdef __GENKSYMS__
+/* struct cpuidle_device */
 #include <linux/cpuidle.h>
-#endif
-
-struct cpuidle_device;
 
 DECLARE_HOOK(android_vh_cpu_idle_enter,
 	TP_PROTO(int *state, struct cpuidle_device *dev),

@@ -23,7 +23,7 @@ struct uniphier_glue_reset_soc_data {
 
 struct uniphier_glue_reset_priv {
 	struct clk_bulk_data clk[MAX_CLKS];
-	struct reset_control_bulk_data rst[MAX_RSTS];
+	struct reset_control *rst[MAX_RSTS];
 	struct reset_simple_data rdata;
 	const struct uniphier_glue_reset_soc_data *data;
 };
@@ -33,7 +33,9 @@ static int uniphier_glue_reset_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct uniphier_glue_reset_priv *priv;
 	struct resource *res;
-	int i, ret;
+	resource_size_t size;
+	const char *name;
+	int i, ret, nr;
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
@@ -45,6 +47,7 @@ static int uniphier_glue_reset_probe(struct platform_device *pdev)
 		return -EINVAL;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	size = resource_size(res);
 	priv->rdata.membase = devm_ioremap_resource(dev, res);
 	if (IS_ERR(priv->rdata.membase))
 		return PTR_ERR(priv->rdata.membase);
@@ -55,24 +58,26 @@ static int uniphier_glue_reset_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	for (i = 0; i < priv->data->nrsts; i++)
-		priv->rst[i].id = priv->data->reset_names[i];
-	ret = devm_reset_control_bulk_get_shared(dev, priv->data->nrsts,
-						 priv->rst);
-	if (ret)
-		return ret;
+	for (i = 0; i < priv->data->nrsts; i++) {
+		name = priv->data->reset_names[i];
+		priv->rst[i] = devm_reset_control_get_shared(dev, name);
+		if (IS_ERR(priv->rst[i]))
+			return PTR_ERR(priv->rst[i]);
+	}
 
 	ret = clk_bulk_prepare_enable(priv->data->nclks, priv->clk);
 	if (ret)
 		return ret;
 
-	ret = reset_control_bulk_deassert(priv->data->nrsts, priv->rst);
-	if (ret)
-		goto out_clk_disable;
+	for (nr = 0; nr < priv->data->nrsts; nr++) {
+		ret = reset_control_deassert(priv->rst[nr]);
+		if (ret)
+			goto out_rst_assert;
+	}
 
 	spin_lock_init(&priv->rdata.lock);
 	priv->rdata.rcdev.owner = THIS_MODULE;
-	priv->rdata.rcdev.nr_resets = resource_size(res) * BITS_PER_BYTE;
+	priv->rdata.rcdev.nr_resets = size * BITS_PER_BYTE;
 	priv->rdata.rcdev.ops = &reset_simple_ops;
 	priv->rdata.rcdev.of_node = dev->of_node;
 	priv->rdata.active_low = true;
@@ -86,9 +91,9 @@ static int uniphier_glue_reset_probe(struct platform_device *pdev)
 	return 0;
 
 out_rst_assert:
-	reset_control_bulk_assert(priv->data->nrsts, priv->rst);
+	while (nr--)
+		reset_control_assert(priv->rst[nr]);
 
-out_clk_disable:
 	clk_bulk_disable_unprepare(priv->data->nclks, priv->clk);
 
 	return ret;
@@ -97,8 +102,10 @@ out_clk_disable:
 static int uniphier_glue_reset_remove(struct platform_device *pdev)
 {
 	struct uniphier_glue_reset_priv *priv = platform_get_drvdata(pdev);
+	int i;
 
-	reset_control_bulk_assert(priv->data->nrsts, priv->rst);
+	for (i = 0; i < priv->data->nrsts; i++)
+		reset_control_assert(priv->rst[i]);
 
 	clk_bulk_disable_unprepare(priv->data->nclks, priv->clk);
 

@@ -867,8 +867,7 @@ try_again:
 	 * the CCS bit is set as well. We deliberately deviate from the spec in
 	 * regards to this, which allows UHS-I to be supported for SDSC cards.
 	 */
-	if (!mmc_host_is_spi(host) && (ocr & SD_OCR_S18R) &&
-	    rocr && (*rocr & SD_ROCR_S18A)) {
+	if (!mmc_host_is_spi(host) && rocr && (*rocr & 0x01000000)) {
 		err = mmc_set_uhs_voltage(host, pocr);
 		if (err == -EAGAIN) {
 			retries--;
@@ -947,15 +946,14 @@ int mmc_sd_setup_card(struct mmc_host *host, struct mmc_card *card,
 
 		/* Erase init depends on CSD and SSR */
 		mmc_init_erase(card);
-	}
 
-	/*
-	 * Fetch switch information from card. Note, sd3_bus_mode can change if
-	 * voltage switch outcome changes, so do this always.
-	 */
-	err = mmc_read_switch(card);
-	if (err)
-		return err;
+		/*
+		 * Fetch switch information from card.
+		 */
+		err = mmc_read_switch(card);
+		if (err)
+			return err;
+	}
 
 	/*
 	 * For SPI, enable CRC as appropriate.
@@ -1256,7 +1254,7 @@ static int sd_read_ext_regs(struct mmc_card *card)
 	 */
 	err = sd_read_ext_reg(card, 0, 0, 0, 512, gen_info_buf);
 	if (err) {
-		pr_err("%s: error %d reading general info of SD ext reg\n",
+		pr_warn("%s: error %d reading general info of SD ext reg\n",
 			mmc_hostname(card->host), err);
 		goto out;
 	}
@@ -1270,12 +1268,7 @@ static int sd_read_ext_regs(struct mmc_card *card)
 	/* Number of extensions to be find. */
 	num_ext = gen_info_buf[4];
 
-	/*
-	 * We only support revision 0 and limit it to 512 bytes for simplicity.
-	 * No matter what, let's return zero to allow us to continue using the
-	 * card, even if we can't support the features from the SD function
-	 * extensions registers.
-	 */
+	/* We support revision 0, but limit it to 512 bytes for simplicity. */
 	if (rev != 0 || len > 512) {
 		pr_warn("%s: non-supported SD ext reg layout\n",
 			mmc_hostname(card->host));
@@ -1290,7 +1283,7 @@ static int sd_read_ext_regs(struct mmc_card *card)
 	for (i = 0; i < num_ext; i++) {
 		err = sd_parse_ext_reg(card, gen_info_buf, &next_ext_addr);
 		if (err) {
-			pr_err("%s: error %d parsing SD ext reg\n",
+			pr_warn("%s: error %d parsing SD ext reg\n",
 				mmc_hostname(card->host), err);
 			goto out;
 		}
@@ -1484,15 +1477,26 @@ retry:
 	if (!v18_fixup_failed && !mmc_host_is_spi(host) && mmc_host_uhs(host) &&
 	    mmc_sd_card_using_v18(card) &&
 	    host->ios.signal_voltage != MMC_SIGNAL_VOLTAGE_180) {
-		if (mmc_host_set_uhs_voltage(host) ||
-		    mmc_sd_init_uhs_card(card)) {
-			v18_fixup_failed = true;
-			mmc_power_cycle(host, ocr);
-			if (!oldcard)
-				mmc_remove_card(card);
-			goto retry;
+		/*
+		 * Re-read switch information in case it has changed since
+		 * oldcard was initialized.
+		 */
+		if (oldcard) {
+			err = mmc_read_switch(card);
+			if (err)
+				goto free_card;
 		}
-		goto cont;
+		if (mmc_sd_card_using_v18(card)) {
+			if (mmc_host_set_uhs_voltage(host) ||
+			    mmc_sd_init_uhs_card(card)) {
+				v18_fixup_failed = true;
+				mmc_power_cycle(host, ocr);
+				if (!oldcard)
+					mmc_remove_card(card);
+				goto retry;
+			}
+			goto done;
+		}
 	}
 
 	/* Initialization sequence for UHS-I cards */
@@ -1515,9 +1519,7 @@ retry:
 		 */
 		mmc_set_clock(host, mmc_sd_get_max_clock(card));
 
-		err = 0;
 		trace_android_vh_mmc_sd_update_cmdline_timing(card, &err);
-		trace_android_rvh_mmc_sd_cmdline_timing(card, &err);
 		if (err)
 			goto free_card;
 
@@ -1533,13 +1535,11 @@ retry:
 			mmc_set_bus_width(host, MMC_BUS_WIDTH_4);
 		}
 
-		err = 0;
 		trace_android_vh_mmc_sd_update_dataline_timing(card, &err);
-		trace_android_rvh_mmc_sd_dataline_timing(card, &err);
 		if (err)
 			goto free_card;
 	}
-cont:
+
 	if (!oldcard) {
 		/* Read/parse the extension registers. */
 		err = sd_read_ext_regs(card);
@@ -1571,7 +1571,7 @@ cont:
 		err = -EINVAL;
 		goto free_card;
 	}
-
+done:
 	host->card = card;
 	return 0;
 

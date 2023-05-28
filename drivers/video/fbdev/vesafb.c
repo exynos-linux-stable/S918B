@@ -490,11 +490,10 @@ static int vesafb_remove(struct platform_device *pdev)
 {
 	struct fb_info *info = platform_get_drvdata(pdev);
 
-	if (((struct vesafb_par *)(info->par))->region)
-		release_region(0x3c0, 32);
-
 	/* vesafb_destroy takes care of info cleanup */
 	unregister_framebuffer(info);
+	if (((struct vesafb_par *)(info->par))->region)
+		release_region(0x3c0, 32);
 
 	return 0;
 }
